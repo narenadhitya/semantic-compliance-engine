@@ -1,8 +1,10 @@
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
-from ingestion import extract_text_factory
 import os
 import argparse
+
+from ingestion import extract_text_factory
+from database import setup_database, store_vectors_in_db
 
 def ingest_chunk_vectorize(file_path: str):
 
@@ -34,6 +36,13 @@ def ingest_chunk_vectorize(file_path: str):
         # Display the first chunk and a snippet of its corresponding vector
         print(f"\nSample Chunk [0]:\n\"{chunks[0]}\"")
         print(f"Sample Vector [0] Preview: {embeddings[0][:5]} ...")
+
+        # Extract just the file name (e.g., 'policy.pdf' instead of 'C:/folder/policy.pdf')
+        document_filename = os.path.basename(file_path)
+        
+        # Ensure the table exists, then save the data
+        setup_database()
+        store_vectors_in_db(document_filename, chunks, embeddings)
 
 if __name__ == "__main__":
     # 1. Initialize the Argument Parser
