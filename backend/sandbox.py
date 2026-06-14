@@ -1,27 +1,61 @@
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
+from ingestion import extract_text_factory
+import os
+import argparse
 
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=20)
+def ingest_chunk_vectorize(file_path: str):
 
-sample_text = """
-Core office hours begin strictly at 9 AM for all personnel. 
-Flexible arrivals are permitted until 10 AM on remote alternating days.
-In modern production systems at companies like Sopra Steria,
- you use a pattern called De-coupled Storage and Metadata Indexing. 
- You store the heavy asset in S3, and you store the map and math of 
- that asset inside PostgreSQL
- Yes, you still absolutely need PostgreSQL. This 
- is one of the most common points of confusion when starting out with system 
- architecture. To understand why you need both, you have to understand that 
- Amazon S3 
- and PostgreSQL are built to do two completely different, non-overlapping jobs.
-"""
+    print(f"\n--- Initializing Pipeline for: {file_path} ---")
 
-chunks = text_splitter.split_text(sample_text)
-print(f"Generated {len(chunks)} text chunks.")
+    # 1. Ingestion Layer
+    try:
+        raw_text = extract_text_factory(file_path)
+        print(f"[+] Successfully extracted and normalized text (Length: {len(raw_text)} chars).")
+    except Exception as e:
+        print(f"[-] Ingestion Failed: {e}")
+        return
+    
+    # 2. Chunking Layer
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=60)
+    chunks = text_splitter.split_text(raw_text)
+    print(f"[+] Deterministic chunking complete. Generated {len(chunks)} contextual text chunks.")
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
+    # 3. Vector Embedding Layer
+    if chunks:
+        print("[+] Loading local SentenceTransformer model (all-MiniLM-L6-v2)...")
 
-embeddings = model.encode(chunks)
-print(f"Vector Matrix Shape: {embeddings.shape}")
-print(embeddings)
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+
+        embeddings = model.encode(chunks)
+        print("\n--- Pipeline Execution Complete ---")
+        print(f"Vector Matrix Shape: {embeddings.shape} (Chunks, Dimensions)")
+
+        # Display the first chunk and a snippet of its corresponding vector
+        print(f"\nSample Chunk [0]:\n\"{chunks[0]}\"")
+        print(f"Sample Vector [0] Preview: {embeddings[0][:5]} ...")
+
+if __name__ == "__main__":
+    # 1. Initialize the Argument Parser
+    parser = argparse.ArgumentParser(
+        description="Run the Semantic Compliance Ingestion Pipeline on a specific document."
+    )
+    
+    # 2. Define the expected argument (the file path)
+    parser.add_argument(
+        "filepath", 
+        type=str, 
+        help="The relative or absolute path to the document you want to process."
+    )
+    
+    # 3. Parse the command-line input
+    args = parser.parse_args()
+    target_document = args.filepath
+
+    # 4. Validate the path exists before running the heavy AI models
+    if not os.path.exists(target_document):
+        print(f"\nArchitecture Error: Could not locate the file at path: '{target_document}'")
+        print("Please ensure the path is correct and the file extension is included.")
+    else:
+        # 5. Run the pipeline dynamically
+        ingest_chunk_vectorize(target_document)
