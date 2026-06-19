@@ -1,10 +1,11 @@
 import os
 import psycopg2
-from pgvector import register_vector
+from pgvector.psycopg2 import register_vector
 import numpy as np
 from dotenv import load_dotenv
 
-load_dotenv()
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=env_path, override=True)
 
 SUPABASE_URI = os.getenv("SUPABASE_URI")
 
