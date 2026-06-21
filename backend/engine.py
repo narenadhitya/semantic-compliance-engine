@@ -1,26 +1,20 @@
 import psycopg2
 import difflib
 import json
+import os
 from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
-# Update these to match your local PostgreSQL credentials
-DB_NAME = "compliance_db"
-DB_USER = "postgres"
-DB_PASS = "your_password"
-DB_HOST = "localhost"
-DB_PORT = "5432"
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=env_path, override=True)
 
-TABLE_NAME = "document_chunks" # Update if your Phase 2 table has a different name
+SUPABASE_URI = os.getenv("SUPABASE_URI")
+
+if not SUPABASE_URI:
+    raise ValueError("Architecture Error: SUPABASE_URI is missing. Check your .env file.")
 
 def get_db_connection():
-    return psycopg2.connect(
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
-        host=DB_HOST,
-        port=DB_PORT
-    )
+    return psycopg2.connect(SUPABASE_URI)
 
 def fetch_document_chunks(filename: str):
     """Fetches all chunks and their vectors for a specific document."""
