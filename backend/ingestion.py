@@ -28,7 +28,7 @@ def extract_text_factory(file_path: str) -> str:
             
             if "w:drawing" in para._p.xml:
                 body_elements.append("\n[IMAGE ALIAS: Embedde Word Diagram/Graphic Layout]\n")
-                return "\n".join(body_elements)
+        return "\n".join(body_elements)
     
     # 3. PowerPoint Presentations (.pptx)
     elif ext == '.pptx':
