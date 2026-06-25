@@ -1,59 +1,97 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import engine  # This imports the engine.py file we just finished!
+import os
+import shutil
 
-app = FastAPI(title="Semantic Compliance API")
+# Import your internal pipeline modules
+import engine 
+from sandbox import ingest_chunk_vectorize 
+
+app = FastAPI(title="Semantic Compliance Engine API")
 
 # Allow your React frontend to talk to this server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to localhost:3000
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Define the JSON structure we expect from React
-class AuditRequest(BaseModel):
-    source_file: str
-    target_file: str
+# Temporary storage for incoming files before ingestion
+UPLOAD_DIR = "uploaded_temp"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 @app.get("/")
 def health_check():
-    return {"status": "Online", "message": "Compliance Engine is running."}
+    return {"status": "Online", "message": "Knowledge Graph Engine is running."}
+
+
+@app.post("/api/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """
+    1. Receives the file from React.
+    2. Runs PyTorch vectorization.
+    3. Silently pre-computes Knowledge Graph edges and conflicts.
+    """
+    try:
+        file_path = os.path.join(UPLOAD_DIR, file.filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # 1. Extract text, chunk, and embed vectors
+        print(f"\n[API] Ingesting new document: {file.filename}")
+        ingest_chunk_vectorize(file_path)
+        
+        # 2. Trigger HNSW Pre-Computation for the Knowledge Graph
+        engine.compute_graph_edges(file.filename)
+        
+        # Cleanup
+        os.remove(file_path)
+        
+        return {"status": "success", "message": "Document ingested and Graph updated."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/documents")
 def list_documents():
-    """
-    Returns a distinct list of all corporate policies 
-    currently indexed in the PostgreSQL vector database.
-    """
+    """Returns a distinct list of all corporate policies."""
     try:
         doc_list = engine.fetch_all_document_names()
-        return {
-            "status": "success",
-            "total_documents": len(doc_list),
-            "documents": doc_list
-        }
+        return {"status": "success", "total": len(doc_list), "documents": doc_list}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    
-@app.post("/api/compare")
-def compare_documents(request: AuditRequest):
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/graph")
+def get_knowledge_graph():
+    """
+    Returns the Nodes (documents) and Edges (semantic relationships)
+    formatted perfectly for the React Force Graph physics engine.
+    """
     try:
-        # 1. We temporarily modify your run_audit function to return a list
-        # instead of just printing to the terminal.
-        results = engine.run_audit_json(request.source_file, request.target_file)
-        
-        if not results:
-            return {"status": "success", "conflicts": []}
-            
+        graph_data = engine.fetch_graph_data()
+        return {"status": "success", "data": graph_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/investigate")
+def investigate_edge(source: str, target: str):
+    """
+    Instantly returns pre-computed contradictions between two documents
+    when a user clicks a connecting line on the Knowledge Graph.
+    """
+    try:
+        conflicts = engine.fetch_conflicts(source, target)
         return {
             "status": "success",
-            "total_conflicts": len(results),
-            "conflicts": results
+            "source": source,
+            "target": target,
+            "total_conflicts": len(conflicts),
+            "conflicts": conflicts
         }
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

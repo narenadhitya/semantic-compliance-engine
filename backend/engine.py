@@ -3,6 +3,7 @@ import difflib
 import json
 import os
 from psycopg2.extras import RealDictCursor
+import difflib
 from dotenv import load_dotenv
 
 env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -17,143 +18,6 @@ if not SUPABASE_URI:
 
 def get_db_connection():
     return psycopg2.connect(SUPABASE_URI)
-
-def fetch_document_chunks(filename: str):
-    """Fetches all chunks and their vectors for a specific document."""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # Assuming columns: id, filename, chunk_text, embedding
-    cur.execute(f"""
-        SELECT id, chunk_text, embedding 
-        FROM {TABLE_NAME} 
-        WHERE document_name = %s
-        ORDER BY id ASC;
-    """, (filename,))
-    
-    chunks = cur.fetchall()
-    cur.close()
-    conn.close()
-    return chunks
-
-def find_nearest_semantic_match(target_filename: str, query_embedding):
-    """Uses pgvector cosine distance (<=>) to find the closest chunk in the target document."""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # Check if psycopg2 already returned a string. If yes, use it directly. 
-    # If it returned a list, format it into a string.
-    if isinstance(query_embedding, str):
-        vector_string = query_embedding
-    else:
-        vector_string = '[' + ','.join(map(str, query_embedding)) + ']'
-    
-    # Note: Make sure your column name here (e.g., document_filename) 
-    # matches what you fixed in the previous step!
-    cur.execute(f"""
-        SELECT chunk_text, (embedding <=> %s::vector) AS cosine_distance
-        FROM {TABLE_NAME}
-        WHERE document_name = %s  
-        ORDER BY embedding <=> %s::vector
-        LIMIT 1;
-    """, (vector_string, target_filename, vector_string))
-    
-    match = cur.fetchone()
-    cur.close()
-    conn.close()
-    return match
-
-def run_audit(doc1_name: str, doc2_name: str):
-    print(f"\n{'='*60}")
-    print(f"AUDIT INITIALIZED: {doc1_name} vs {doc2_name}")
-    print(f"{'='*60}\n")
-
-    doc1_chunks = fetch_document_chunks(doc1_name)
-    if not doc1_chunks:
-        print(f"[-] Error: No data found for {doc1_name} in the database.")
-        return
-
-    conflict_report = []
-
-    for chunk in doc1_chunks:
-        doc1_text = chunk['chunk_text']
-        doc1_vector = chunk['embedding']
-
-        # 1. Vector Math: Find the closest semantic match
-        match = find_nearest_semantic_match(doc2_name, doc1_vector)
-        
-        if not match:
-            continue
-            
-        doc2_text = match['chunk_text']
-        distance = match['cosine_distance']
-
-        # 2. Structural Math: Calculate exact character differences
-        matcher = difflib.SequenceMatcher(None, doc1_text, doc2_text)
-        structural_ratio = matcher.ratio() # Returns 0.0 to 1.0
-
-        # 3. Threshold Evaluation
-        # Distance < 0.05 is usually functionally identical in SentenceTransformers
-        if distance < 0.05:
-            status = "HEALTHY"
-        elif distance > 0.30:
-            status = "DELETED / MISSING"
-        else:
-            status = "CONFLICT (SEMANTIC DRIFT)"
-            
-            # Save the conflict for the final printout
-            conflict_report.append({
-                "doc1_text": doc1_text,
-                "doc2_text": doc2_text,
-                "distance": distance,
-                "structural_match": f"{structural_ratio * 100:.1f}%"
-            })
-
-    # --- Print the CLI Report ---
-    if not conflict_report:
-        print("[+] Audit Complete. 0 Conflicts Detected. Documents are semantically aligned.")
-    else:
-        print(f"[!] Audit Complete. {len(conflict_report)} Conflicts Detected.\n")
-        
-        for idx, conflict in enumerate(conflict_report, 1):
-            print(f"--- CONFLICT {idx} ---")
-            print(f"Status:          SEMANTIC DRIFT")
-            print(f"Vector Distance: {conflict['distance']:.4f} (Closer to 0 is identical)")
-            print(f"Difflib Match:   {conflict['structural_match']} (Literal character overlap)\n")
-            
-            print("ORIGINAL (Doc 1):")
-            print(f"\"{conflict['doc1_text']}\"\n")
-            
-            print("ALTERED (Doc 2):")
-            print(f"\"{conflict['doc2_text']}\"\n")
-            print("-" * 60 + "\n")
-
-def run_audit_json(doc1_name: str, doc2_name: str):
-    doc1_chunks = fetch_document_chunks(doc1_name)
-    if not doc1_chunks:
-        return []
-
-    conflict_report = []
-
-    for chunk in doc1_chunks:
-        doc1_text = chunk['chunk_text']
-        doc1_vector = chunk['embedding']
-
-        match = find_nearest_semantic_match(doc2_name, doc1_vector)
-        if not match:
-            continue
-            
-        doc2_text = match['chunk_text']
-        distance = match['cosine_distance']
-
-        if 0.05 <= distance <= 0.30:
-            conflict_report.append({
-                "original_text": doc1_text,
-                "altered_text": doc2_text,
-                "drift_score": distance
-            })
-
-    return conflict_report
 
 def fetch_all_document_names():
     """Retrieves a unique list of all ingested documents in the database."""
@@ -174,9 +38,124 @@ def fetch_all_document_names():
         print(f"[-] Error fetching document registry: {e}")
         return []
 
-if __name__ == "__main__":
-    # Replace these with the actual filenames you stored in your database during Phase 1/2
-    source_document = "it_security_policy_v1.txt"
-    target_document = "it_security_policy_v2.docx"
+def compute_graph_edges(new_document_name: str):
+    """
+    Runs automatically after a document is uploaded. 
+    It scans the HNSW index for overlapping semantic topics and logs any conflicts.
+    """
+    print(f"\n[GRAPH ENGINE] Calculating semantic edges for '{new_document_name}'...")
     
-    run_audit(source_document, target_document)
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # 1. Fetch the chunks of the newly uploaded document
+    cur.execute("SELECT chunk_text, embedding FROM corporate_policies WHERE document_name = %s;", (new_document_name,))
+    new_chunks = cur.fetchall()
+    
+    # 2. Fetch the names of all OTHER documents currently in the database
+    cur.execute("SELECT DISTINCT document_name FROM corporate_policies WHERE document_name != %s;", (new_document_name,))
+    other_docs = [row['document_name'] for row in cur.fetchall()]
+    
+    for other_doc in other_docs:
+        max_doc_similarity = 0
+        doc_conflicts = []
+        
+        for chunk in new_chunks:
+            # We explicitly format the vector for pgvector
+            if isinstance(chunk['embedding'], str):
+                vector_string = chunk['embedding']
+            else:
+                vector_string = '[' + ','.join(map(str, chunk['embedding'])) + ']'
+            
+            # Use the HNSW Index to find the absolute closest semantic match in the other document
+            cur.execute(f"""
+                SELECT chunk_text, (embedding <=> %s::vector) AS distance
+                FROM {TABLE_NAME}
+                WHERE document_name = %s 
+                ORDER BY embedding <=> %s::vector
+                LIMIT 1;
+            """, (vector_string, other_doc, vector_string))
+            
+            match = cur.fetchone()
+            if not match:
+                continue
+                
+            distance = match['distance']
+            similarity = 1 - distance
+            
+            # Track the strongest overall connection between these two documents
+            if similarity > max_doc_similarity:
+                max_doc_similarity = similarity
+                
+            # If the context matches (distance < 0.25) but the text is different (distance > 0.05) -> IT'S A CONFLICT
+            if 0.05 <= distance <= 0.25:
+                doc_conflicts.append({
+                    "source_text": chunk['chunk_text'],
+                    "target_text": match['chunk_text'],
+                    "drift_score": distance
+                })
+        
+        # 3. Graph Threshold Logic (Executive Decision: 0.82)
+        # If these two documents share a strong semantic relationship, draw an Edge!
+        if max_doc_similarity >= 0.82:
+            print(f"[+] Edge Established: {new_document_name} <---> {other_doc} (Similarity: {max_doc_similarity:.2f})")
+            
+            # Save the Edge
+            cur.execute("""
+                INSERT INTO document_edges (source_doc, target_doc, max_similarity) 
+                VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;
+            """, (new_document_name, other_doc, max_doc_similarity))
+            
+            # Save the specific red/green conflicts tied to this edge
+            for conflict in doc_conflicts:
+                cur.execute("""
+                    INSERT INTO detected_conflicts (source_doc, target_doc, source_text, target_text, drift_score)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (new_document_name, other_doc, conflict['source_text'], conflict['target_text'], conflict['drift_score']))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("[GRAPH ENGINE] Pre-computation complete. Knowledge Graph updated.")
+
+def fetch_graph_data():
+    """Builds the JSON payload required by the React Force Graph library."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # 1. Get Nodes (Every unique document)
+    cur.execute(f"SELECT DISTINCT document_name as id FROM {TABLE_NAME};")
+    nodes = cur.fetchall()
+    
+    # 2. Get Edges (The calculated relationships)
+    cur.execute("SELECT source_doc as source, target_doc as target, max_similarity FROM document_edges;")
+    links = cur.fetchall()
+    
+    cur.close()
+    conn.close()
+    
+    return {
+        "nodes": nodes,
+        "links": links
+    }
+
+def fetch_conflicts(doc1: str, doc2: str):
+    """Fetches the pre-calculated red/green contradictions between two specific files."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # We check both directions in case doc2 was uploaded before doc1
+    cur.execute("""
+        SELECT source_text, target_text, drift_score 
+        FROM detected_conflicts 
+        WHERE (source_doc = %s AND target_doc = %s)
+           OR (source_doc = %s AND target_doc = %s)
+        ORDER BY drift_score ASC;
+    """, (doc1, doc2, doc2, doc1))
+    
+    conflicts = cur.fetchall()
+    
+    cur.close()
+    conn.close()
+    
+    return conflicts
