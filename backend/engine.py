@@ -155,6 +155,25 @@ def run_audit_json(doc1_name: str, doc2_name: str):
 
     return conflict_report
 
+def fetch_all_document_names():
+    """Retrieves a unique list of all ingested documents in the database."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # We use DISTINCT so if a file has 50 chunks, its name only appears once
+        cur.execute(f"SELECT DISTINCT document_name FROM {TABLE_NAME} ORDER BY document_name ASC;")
+        
+        # Unpack the list of tuples returned by psycopg2
+        documents = [row[0] for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+        return documents
+    except Exception as e:
+        print(f"[-] Error fetching document registry: {e}")
+        return []
+
 if __name__ == "__main__":
     # Replace these with the actual filenames you stored in your database during Phase 1/2
     source_document = "it_security_policy_v1.txt"

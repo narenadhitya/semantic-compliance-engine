@@ -23,6 +23,22 @@ class AuditRequest(BaseModel):
 def health_check():
     return {"status": "Online", "message": "Compliance Engine is running."}
 
+@app.get("/api/documents")
+def list_documents():
+    """
+    Returns a distinct list of all corporate policies 
+    currently indexed in the PostgreSQL vector database.
+    """
+    try:
+        doc_list = engine.fetch_all_document_names()
+        return {
+            "status": "success",
+            "total_documents": len(doc_list),
+            "documents": doc_list
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    
 @app.post("/api/compare")
 def compare_documents(request: AuditRequest):
     try:
