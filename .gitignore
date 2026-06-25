@@ -218,3 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 test/
+
+backend/demo.py
+backend/downloaded_audit_copy.docx
+backend/downloaded_audit_copy.pdf
+backend/ititi.py
