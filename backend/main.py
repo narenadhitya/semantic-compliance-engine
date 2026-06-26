@@ -5,14 +5,24 @@ import shutil
 
 # Import your internal pipeline modules
 import engine 
+from database import setup_database
 from sandbox import ingest_chunk_vectorize 
 
 app = FastAPI(title="Semantic Compliance Engine API")
 
-# Allow your React frontend to talk to this server
+
+@app.on_event("startup")
+def initialize_schema():
+    setup_database()
+
+# --- SECURITY PERIMETER OVERRIDE (CORS) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=[
+        "http://localhost",
+        "http://127.0.0.1"
+    ],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,6 +84,16 @@ def get_knowledge_graph():
     try:
         graph_data = engine.fetch_graph_data()
         return {"status": "success", "data": graph_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/graph/rebuild")
+def rebuild_knowledge_graph():
+    """Recomputes every edge and conflict from the stored document chunks."""
+    try:
+        engine.rebuild_graph_edges()
+        return {"status": "success", "message": "Knowledge graph rebuilt from all documents."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
