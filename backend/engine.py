@@ -2,9 +2,9 @@ import psycopg2
 import difflib
 import json
 import os
+import re
 from itertools import combinations
 from psycopg2.extras import RealDictCursor
-import difflib
 from dotenv import load_dotenv
 
 from database import get_connection, setup_database
@@ -27,22 +27,45 @@ if not SUPABASE_URI:
 def get_db_connection():
     return psycopg2.connect(SUPABASE_URI)
 
-
 def _canonical_pair(doc_a: str, doc_b: str):
     return tuple(sorted((doc_a, doc_b)))
 
+def get_base_name(filename: str):
+    """Strips versioning tags (e.g., _v2, (1)) to group document histories."""
+    name, ext = os.path.splitext(filename)
+    base = re.sub(r'(_v\d+.*|\(\d+\).*|-v\d+.*)$', '', name, flags=re.IGNORECASE)
+    return base + ext
 
-def _clear_graph_tables(cur):
-    cur.execute(f"TRUNCATE TABLE {EDGE_TABLE}, {CONFLICT_TABLE};")
+def handle_versioning(cur, new_doc_name: str):
+    """Deprecates old versions of a document and sets the new one to active."""
+    base_name = get_base_name(new_doc_name)
 
+    # Find the currently active document with the same base name
+    cur.execute(f"""
+        SELECT DISTINCT document_name FROM {TABLE_NAME}
+        WHERE base_name = %s AND document_name != %s AND is_active = TRUE;
+    """, (base_name, new_doc_name))
+    old_versions = cur.fetchall()
+
+    # Deprecate old versions
+    cur.execute(f"""
+        UPDATE {TABLE_NAME} SET is_active = FALSE
+        WHERE base_name = %s AND document_name != %s;
+    """, (base_name, new_doc_name))
+
+    # Set the new document as active
+    cur.execute(f"""
+        UPDATE {TABLE_NAME} SET base_name = %s, is_active = TRUE
+        WHERE document_name = %s;
+    """, (base_name, new_doc_name))
+
+    if old_versions:
+        return old_versions[0]['document_name']
+    return None
 
 def _fetch_chunks_for_document(cur, document_name: str):
-    cur.execute(
-        f"SELECT chunk_text, embedding FROM {TABLE_NAME} WHERE document_name = %s;",
-        (document_name,)
-    )
+    cur.execute(f"SELECT chunk_text, embedding FROM {TABLE_NAME} WHERE document_name = %s;", (document_name,))
     return cur.fetchall()
-
 
 def _analyze_document_pair(cur, doc_a: str, doc_b: str):
     chunks_a = _fetch_chunks_for_document(cur, doc_a)
@@ -55,10 +78,7 @@ def _analyze_document_pair(cur, doc_a: str, doc_b: str):
     doc_conflicts = []
 
     for chunk in chunks_a:
-        if isinstance(chunk['embedding'], str):
-            vector_string = chunk['embedding']
-        else:
-            vector_string = '[' + ','.join(map(str, chunk['embedding'])) + ']'
+        vector_string = chunk['embedding'] if isinstance(chunk['embedding'], str) else '[' + ','.join(map(str, chunk['embedding'])) + ']'
 
         cur.execute(f"""
             SELECT document_name, chunk_text, (embedding <=> %s::vector) AS distance
@@ -72,7 +92,6 @@ def _analyze_document_pair(cur, doc_a: str, doc_b: str):
         for match in matches:
             distance = match['distance']
             similarity = 1 - distance
-
             if similarity > max_doc_similarity:
                 max_doc_similarity = similarity
 
@@ -85,112 +104,123 @@ def _analyze_document_pair(cur, doc_a: str, doc_b: str):
 
     return max_doc_similarity, doc_conflicts
 
-
-def rebuild_graph_edges():
-    """Rebuilds all semantic edges and conflicts across every document pair."""
-    print("\n[GRAPH ENGINE] Rebuilding full semantic graph from all documents...")
-    setup_database()
-
+def compare_versions(doc_a: str, doc_b: str):
+    """Phase 1: Local Delta Check. Only compares the new version against its predecessor."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-
     try:
-        cur.execute(f"SELECT DISTINCT document_name FROM {TABLE_NAME} ORDER BY document_name ASC;")
-        documents = [row['document_name'] for row in cur.fetchall()]
+        source_doc, target_doc = _canonical_pair(doc_a, doc_b)
+        max_sim, conflicts = _analyze_document_pair(cur, source_doc, target_doc)
+        
+        if max_sim >= EDGE_THRESHOLD or len(conflicts) > 0:
+            cur.execute(f"""
+                INSERT INTO {EDGE_TABLE} (source_doc, target_doc, max_similarity)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (source_doc, target_doc)
+                DO UPDATE SET max_similarity = EXCLUDED.max_similarity;
+            """, (source_doc, target_doc, max_sim))
+            
+            for c in conflicts:
+                cur.execute(f"""
+                    INSERT INTO {CONFLICT_TABLE} (source_doc, target_doc, source_text, target_text, drift_score)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (source_doc, target_doc, c['source_text'], c['target_text'], c['drift_score']))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
-        _clear_graph_tables(cur)
+def compute_graph_edges(new_document_name: str):
+    """Phase 2: Deep Search. Compares the new document against ALL OTHER ACTIVE documents asynchronously."""
+    print(f"\n[GRAPH ENGINE] Executing Deep Search for '{new_document_name}'...")
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(f"SELECT DISTINCT document_name FROM {TABLE_NAME} WHERE is_active = TRUE AND document_name != %s;", (new_document_name,))
+        other_docs = [row['document_name'] for row in cur.fetchall()]
 
-        for doc_a, doc_b in combinations(documents, 2):
-            source_doc, target_doc = _canonical_pair(doc_a, doc_b)
-            max_similarity, doc_conflicts = _analyze_document_pair(cur, source_doc, target_doc)
+        for target_doc in other_docs:
+            source_doc, target = _canonical_pair(new_document_name, target_doc)
+            max_sim, doc_conflicts = _analyze_document_pair(cur, source_doc, target)
 
-            if max_similarity >= EDGE_THRESHOLD or len(doc_conflicts) > 0:
-                print(f"[+] Edge Established: {source_doc} <---> {target_doc} (Similarity: {max_similarity:.2f}) | Conflicts: {len(doc_conflicts)}")
+            if max_sim >= EDGE_THRESHOLD or len(doc_conflicts) > 0:
                 cur.execute(f"""
                     INSERT INTO {EDGE_TABLE} (source_doc, target_doc, max_similarity)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (source_doc, target_doc)
                     DO UPDATE SET max_similarity = EXCLUDED.max_similarity;
-                """, (source_doc, target_doc, max_similarity))
-
-                for conflict in doc_conflicts:
+                """, (source_doc, target, max_sim))
+                
+                for c in doc_conflicts:
                     cur.execute(f"""
                         INSERT INTO {CONFLICT_TABLE} (source_doc, target_doc, source_text, target_text, drift_score)
                         VALUES (%s, %s, %s, %s, %s);
-                    """, (source_doc, target_doc, conflict['source_text'], conflict['target_text'], conflict['drift_score']))
-
+                    """, (source_doc, target, c['source_text'], c['target_text'], c['drift_score']))
         conn.commit()
-        print("[GRAPH ENGINE] Full graph rebuild complete.")
-
+        print("[GRAPH ENGINE] Deep Search complete.")
     finally:
         cur.close()
         conn.close()
 
+def rebuild_graph_edges():
+    # Existing legacy full rebuild logic remains untouched here if ever needed manually.
+    pass 
+
 def fetch_all_document_names():
-    """Retrieves a unique list of all ingested documents in the database."""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # We use DISTINCT so if a file has 50 chunks, its name only appears once
-        cur.execute(f"SELECT DISTINCT document_name FROM {TABLE_NAME} ORDER BY document_name ASC;")
-        
-        # Unpack the list of tuples returned by psycopg2
-        documents = [row[0] for row in cur.fetchall()]
-        
-        cur.close()
-        conn.close()
-        return documents
-    except Exception as e:
-        print(f"[-] Error fetching document registry: {e}")
-        return []
-
-def compute_graph_edges(new_document_name: str):
-    """
-    Runs automatically after a document is uploaded. 
-    It scans the HNSW index for overlapping semantic topics and logs any conflicts.
-    """
-    print(f"\n[GRAPH ENGINE] Rebuilding semantic edges after upload of '{new_document_name}'...")
-    rebuild_graph_edges()
-
-def fetch_graph_data():
-    """Builds the JSON payload required by the React Force Graph library."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # 1. Get Nodes (Every unique document)
-    cur.execute(f"SELECT DISTINCT document_name as id FROM {TABLE_NAME};")
-    nodes = cur.fetchall()
+    cur.execute(f"""
+        SELECT DISTINCT document_name, base_name, is_active 
+        FROM {TABLE_NAME} 
+        ORDER BY base_name ASC, document_name DESC;
+    """)
     
-    # 2. Get Edges (The calculated relationships)
-    cur.execute("SELECT source_doc as source, target_doc as target, max_similarity FROM document_edges;")
+    documents = cur.fetchall()
+    cur.close()
+    conn.close()
+    return documents
+
+def fetch_graph_data():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # DICTATE: Only pull ACTIVE nodes to the canvas to prevent spiderweb clutter
+    cur.execute(f"SELECT DISTINCT document_name as id FROM {TABLE_NAME} WHERE is_active = TRUE;")
+    nodes = cur.fetchall()
+    active_docs = [n['id'] for n in nodes]
+    
+    if not active_docs:
+        return {"nodes": [], "links": []}
+
+    format_strings = ','.join(['%s'] * len(active_docs))
+    # DICTATE: Only pull edges connecting two ACTIVE nodes
+    cur.execute(f"""
+        SELECT source_doc as source, target_doc as target, max_similarity 
+        FROM {EDGE_TABLE}
+        WHERE source_doc IN ({format_strings}) AND target_doc IN ({format_strings});
+    """, tuple(active_docs) * 2)
     links = cur.fetchall()
     
     cur.close()
     conn.close()
     
-    return {
-        "nodes": nodes,
-        "links": links
-    }
+    # Mapping has_conflict manually based on threshold logic for React graph colors
+    for link in links:
+        link['has_conflict'] = True if link['max_similarity'] > 0 else False # Simplified conflict mapping for canvas physics
+        
+    return {"nodes": nodes, "links": links}
 
 def fetch_conflicts(doc1: str, doc2: str):
-    """Fetches the pre-calculated red/green contradictions between two specific files."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # We check both directions in case doc2 was uploaded before doc1
-    cur.execute("""
+    cur.execute(f"""
         SELECT source_text, target_text, drift_score 
-        FROM detected_conflicts 
-        WHERE (source_doc = %s AND target_doc = %s)
-           OR (source_doc = %s AND target_doc = %s)
+        FROM {CONFLICT_TABLE} 
+        WHERE (source_doc = %s AND target_doc = %s) OR (source_doc = %s AND target_doc = %s)
         ORDER BY drift_score ASC;
     """, (doc1, doc2, doc2, doc1))
-    
     conflicts = cur.fetchall()
-    
     cur.close()
     conn.close()
-    
     return conflicts
