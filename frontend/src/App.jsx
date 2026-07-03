@@ -19,6 +19,14 @@ export default function App() {
   
   const containerRef = useRef(null);
   const fileInputRef = useRef(null);
+  const [activeMenu, setActiveMenu] = useState(null);
+
+  // Add this global listener to close the menu when clicking anywhere else on the screen
+  useEffect(() => {
+    const handleClickOutside = () => setActiveMenu(null);
+    window.addEventListener('click', handleClickOutside);
+    return () => window.removeEventListener('click', handleClickOutside);
+  }, []);
 
   const loadWorkspace = async () => {
     try {
@@ -278,18 +286,99 @@ const executeDeepSearch = async () => {
                 <div style={{padding: '10px 8px', fontSize: '11px', color: '#586170', fontStyle: 'italic'}}>No infrastructure mapped.</div>
               ) : (
                 documents.map((doc, idx) => {
-                  // DICTATE: Extract object properties safely to prevent React from crashing
                   const docName = typeof doc === 'string' ? doc : doc.document_name;
                   const isActive = typeof doc === 'string' ? true : doc.is_active;
 
                   return (
-                    <div key={idx} className="file-row" style={{ opacity: isActive ? 1 : 0.4 }}>
+                    <div key={idx} className="file-row" style={{ opacity: isActive ? 1 : 0.4, position: 'relative' }}>
                       <span className={`health-dot ${isActive ? 'healthy' : 'warning'}`}></span>
                       <span className="file-icon">▤</span>
-                      <div className="file-meta">
+                      <div className="file-meta" style={{ flex: 1, minWidth: 0 }}>
                         <div className="file-name">{docName}</div>
                         <div className="file-date mono">{isActive ? 'Active Node' : 'Archived Delta'}</div>
                       </div>
+
+                      {/* THE CONTEXT MENU TRIGGER */}
+                      <div style={{ position: 'relative' }}>
+                        <button 
+                          onClick={(e) => {
+                            e.stopPropagation(); // Prevents the window click listener from firing immediately
+                            setActiveMenu(activeMenu === docName ? null : docName);
+                          }}
+                          style={{
+                            background: 'transparent', border: 'none', cursor: 'pointer', padding: '4px',
+                            display: 'flex', alignItems: 'center', opacity: 0.6, transition: 'opacity 0.2s'
+                          }}
+                          onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
+                          onMouseLeave={(e) => e.currentTarget.style.opacity = '0.6'}
+                        >
+                          {/* Raw SVG for the 3 vertical dots */}
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#e8eaed" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="12" cy="12" r="1.5"></circle>
+                            <circle cx="12" cy="5" r="1.5"></circle>
+                            <circle cx="12" cy="19" r="1.5"></circle>
+                          </svg>
+                        </button>
+
+                        {/* THE DROPDOWN PANEL */}
+                        {activeMenu === docName && (
+                          <div style={{
+                            position: 'absolute', right: 0, top: '24px', background: '#1c2430', 
+                            border: '1px solid #28323e', borderRadius: '6px', padding: '4px', 
+                            zIndex: 50, minWidth: '140px', boxShadow: '0 10px 25px rgba(0,0,0,0.5)'
+                          }}>
+                            {/* Run Deep Search Option */}
+                            <div 
+                              onClick={(e) => { 
+                                e.stopPropagation(); 
+                                setActiveMenu(null); 
+                                setDeepSearchPrompt(docName); // Summons our existing Modal
+                              }}
+                              style={{
+                                padding: '8px 10px', fontSize: '11px', color: '#6fa8c9', cursor: 'pointer', 
+                                display: 'flex', alignItems: 'center', gap: '6px', borderRadius: '4px',
+                                transition: 'background 0.15s', marginBottom: '2px'
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(111, 168, 201, 0.1)'}
+                              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                            >
+                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                              Run Deep Search
+                            </div>
+
+                            {/* Destroy File Option */}
+                            <div 
+                              onClick={(e) => { e.stopPropagation(); handleDeleteDocument(docName); }}
+                              style={{
+                                padding: '8px 10px', fontSize: '11px', color: '#c6564a', cursor: 'pointer', 
+                                display: 'flex', alignItems: 'center', gap: '6px', borderRadius: '4px',
+                                transition: 'background 0.15s', marginBottom: '2px'
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(198, 86, 74, 0.1)'}
+                              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                            >
+                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                              Destroy File
+                            </div>
+                            
+                            {/* Archive Record Option */}
+                            <div 
+                              onClick={(e) => { e.stopPropagation(); setActiveMenu(null); }}
+                              style={{
+                                padding: '8px 10px', fontSize: '11px', color: '#8b95a1', cursor: 'pointer', 
+                                display: 'flex', alignItems: 'center', gap: '6px', borderRadius: '4px',
+                                transition: 'background 0.15s'
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#212b38'}
+                              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                            >
+                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="4" width="20" height="5" rx="2" ry="2"></rect><path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9"></path><line x1="10" y1="13" x2="14" y2="13"></line></svg>
+                              Archive Record
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      
                     </div>
                   );
                 })
