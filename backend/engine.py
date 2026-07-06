@@ -31,10 +31,15 @@ def _canonical_pair(doc_a: str, doc_b: str):
     return tuple(sorted((doc_a, doc_b)))
 
 def get_base_name(filename: str):
-    """Strips versioning tags (e.g., _v2, (1)) to group document histories."""
-    name, ext = os.path.splitext(filename)
-    base = re.sub(r'(_v\d+.*|\(\d+\).*|-v\d+.*)$', '', name, flags=re.IGNORECASE)
-    return base + ext
+    """Strips extensions and versioning tags to group document histories robustly."""
+    # 1. Strip the extension completely (e.g., .pdf, .docx)
+    name, _ = os.path.splitext(filename)
+    
+    # 2. Match _v1, -v2.1, (1), _final, _draft, v3.0, etc.
+    base = re.sub(r'([_\-\s]*(v\d+.*|\(\d+\)|final|draft|copy|new).*)$', '', name, flags=re.IGNORECASE).strip()
+    
+    # 3. Fallback just in case the regex stripped the entire name
+    return base if base else name
 
 def handle_versioning(cur, new_doc_name: str):
     """Deprecates old versions of a document and sets the new one to active."""
@@ -131,19 +136,24 @@ def compare_versions(doc_a: str, doc_b: str):
         conn.close()
 
 def compute_graph_edges(new_document_name: str):
-    """Phase 2: Deep Search. Compares the new document against ALL OTHER ACTIVE documents asynchronously."""
+    """Phase 2: Deep Search. Compares against ALL OTHER ACTIVE documents."""
     print(f"\n[GRAPH ENGINE] Executing Deep Search for '{new_document_name}'...")
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
         cur.execute(f"SELECT DISTINCT document_name FROM {TABLE_NAME} WHERE is_active = TRUE AND document_name != %s;", (new_document_name,))
         other_docs = [row['document_name'] for row in cur.fetchall()]
+        
+        print(f"[GRAPH ENGINE] Deep search will evaluate {len(other_docs)} other active documents.")
 
         for target_doc in other_docs:
+            print(f" -> Comparing '{new_document_name}' against '{target_doc}'")
             source_doc, target = _canonical_pair(new_document_name, target_doc)
             max_sim, doc_conflicts = _analyze_document_pair(cur, source_doc, target)
 
             if max_sim >= EDGE_THRESHOLD or len(doc_conflicts) > 0:
+                print(f"    [+] Edge Found! Similarity: {max_sim:.2f} | Conflicts: {len(doc_conflicts)}")
                 cur.execute(f"""
                     INSERT INTO {EDGE_TABLE} (source_doc, target_doc, max_similarity)
                     VALUES (%s, %s, %s)
@@ -156,11 +166,14 @@ def compute_graph_edges(new_document_name: str):
                         INSERT INTO {CONFLICT_TABLE} (source_doc, target_doc, source_text, target_text, drift_score)
                         VALUES (%s, %s, %s, %s, %s);
                     """, (source_doc, target, c['source_text'], c['target_text'], c['drift_score']))
+        
         conn.commit()
         print("[GRAPH ENGINE] Deep Search complete.")
+    except Exception as e:
+        print(f"\n[GRAPH ENGINE CRITICAL ERROR] Deep search failed: {e}")
     finally:
-        cur.close()
-        conn.close()
+        if 'cur' in locals(): cur.close()
+        if 'conn' in locals(): conn.close()
 
 def rebuild_graph_edges():
     # Existing legacy full rebuild logic remains untouched here if ever needed manually.
@@ -224,3 +237,37 @@ def fetch_conflicts(doc1: str, doc2: str):
     cur.close()
     conn.close()
     return conflicts
+
+def delete_document(document_name: str):
+    """
+    Surgically removes a document and all of its associated semantic 
+    relationships (edges and conflicts) from the database.
+    """
+    print(f"\n[GRAPH ENGINE] Initiating deletion protocol for '{document_name}'...")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # 1. Sever all graph edges connected to this document
+        cur.execute(f"""
+            DELETE FROM {EDGE_TABLE} 
+            WHERE source_doc = %s OR target_doc = %s;
+        """, (document_name, document_name))
+        
+        # 2. Purge all calculated conflicts involving this document
+        cur.execute(f"""
+            DELETE FROM {CONFLICT_TABLE} 
+            WHERE source_doc = %s OR target_doc = %s;
+        """, (document_name, document_name))
+        
+        # 3. Destroy the actual vectorized chunks
+        cur.execute(f"""
+            DELETE FROM {TABLE_NAME} 
+            WHERE document_name = %s;
+        """, (document_name,))
+        
+        conn.commit()
+        print(f"[GRAPH ENGINE] Deletion complete. {document_name} eradicated.")
+    finally:
+        cur.close()
+        conn.close()

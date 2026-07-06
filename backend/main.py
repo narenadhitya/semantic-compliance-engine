@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
-
+from pydantic import BaseModel
 import engine 
 from database import setup_database
 from sandbox import ingest_chunk_vectorize 
@@ -68,11 +68,15 @@ async def upload_document(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/graph/deep-search/{doc_id}")
-async def trigger_deep_search(doc_id: str, background_tasks: BackgroundTasks):
+class DeepSearchRequest(BaseModel):
+    doc_id: str
+
+# Replace the existing endpoint with this
+@app.post("/api/graph/deep-search")
+async def trigger_deep_search(request: DeepSearchRequest, background_tasks: BackgroundTasks):
     """PHASE 2: Background Deep Search Execution"""
-    background_tasks.add_task(engine.compute_graph_edges, doc_id)
-    return {"status": "accepted", "message": f"Deep search initiated in the background for {doc_id}."}
+    background_tasks.add_task(engine.compute_graph_edges, request.doc_id)
+    return {"status": "accepted", "message": f"Deep search initiated in the background for {request.doc_id}."}
 
 @app.get("/api/documents")
 def list_documents():
@@ -95,5 +99,14 @@ def investigate_edge(source: str, target: str):
     try:
         conflicts = engine.fetch_conflicts(source, target)
         return {"status": "success", "source": source, "target": target, "conflicts": conflicts}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.delete("/api/documents/{doc_name}")
+def delete_document_endpoint(doc_name: str):
+    """API Route to destroy a document and rebuild the active workspace."""
+    try:
+        engine.delete_document(doc_name)
+        return {"status": "success", "message": f"Document {doc_name} destroyed."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
