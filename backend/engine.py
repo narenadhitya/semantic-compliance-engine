@@ -10,17 +10,15 @@ from dotenv import load_dotenv
 
 from pydantic import BaseModel, Field
 from typing import List
-from google import genai
-from google.genai import types
-from openai import OpenAI
+import ollama
 
 from database import get_connection, setup_database
 
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=env_path, override=True)
 
-# Initialize the Gemini Client utilizing the token from your environment
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# Local LLM judge -- no API key, no quota, runs against your local Ollama server.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 
 SUPABASE_URI = os.getenv("SUPABASE_URI")
 
@@ -253,16 +251,16 @@ def retry_pending_enrichment():
 
 def enrich_conflicts(edge_id: int):
     """
-    Runs the Gemini LLM Judge over every un-enriched raw candidate for a given
-    edge, BATCHED (BATCH_SIZE pairs per Gemini call) to conserve quota.
-    Genuine contradictions get upgraded in place with reasoning/summary/
-    highlight terms. False positives (vector-similar but not actually
-    contradictory) are deleted, so the triage view only ever surfaces
-    judge-confirmed conflicts. If a batch call fails outright (e.g. exhausted
-    retries on a 429), every row in that batch is left pending for a later
-    retry via retry_pending_enrichment(), rather than being discarded.
-    Designed to be called from a BackgroundTask so it never blocks the
-    upload/deep-search response.
+    Runs the local Ollama LLM Judge over every un-enriched raw candidate for a
+    given edge, BATCHED (BATCH_SIZE pairs per call) for efficiency. Genuine
+    contradictions get upgraded in place with reasoning/summary/highlight
+    terms. False positives (vector-similar but not actually contradictory)
+    are deleted, so the triage view only ever surfaces judge-confirmed
+    conflicts. If a batch call fails outright (e.g. Ollama server down),
+    every row in that batch is left pending for a later retry via
+    retry_pending_enrichment(), rather than being discarded. Designed to be
+    called from a BackgroundTask so it never blocks the upload/deep-search
+    response.
     """
     if not edge_id:
         return
@@ -285,7 +283,7 @@ def enrich_conflicts(edge_id: int):
 
             if result.get("judge_error", False):
                 print(f"[LLM JUDGE] Batch failed for rows {[r['id'] for r in batch]} -- left pending for retry.")
-                time.sleep(GEMINI_CALL_DELAY_SECONDS)
+                time.sleep(OLLAMA_CALL_DELAY_SECONDS)
                 continue
 
             verdict_map = {v.get("pair_index"): v for v in result.get("verdicts", [])}
@@ -319,7 +317,7 @@ def enrich_conflicts(edge_id: int):
                     cur.execute(f"DELETE FROM {CONFLICT_TABLE} WHERE id = %s;", (row['id'],))
 
             conn.commit()
-            time.sleep(GEMINI_CALL_DELAY_SECONDS)
+            time.sleep(OLLAMA_CALL_DELAY_SECONDS)
 
         print(f"[LLM JUDGE] Enrichment complete for edge {edge_id}.")
     except Exception as e:
@@ -327,14 +325,6 @@ def enrich_conflicts(edge_id: int):
     finally:
         cur.close()
         conn.close()
-
-
-def _extract_retry_delay(error_str: str, default_seconds: int = 20) -> int:
-    """Pulls Gemini's suggested retryDelay (e.g. \"retryDelay': '15s'\") out of the error string."""
-    match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)", error_str)
-    if match:
-        return int(match.group(1)) + 2  # small buffer on top of what the API asked for
-    return default_seconds
 
 
 class BatchAuditItem(BaseModel):
@@ -367,17 +357,19 @@ class BatchAuditReportSchema(BaseModel):
     )
 
 
-BATCH_SIZE = 8
-GEMINI_CALL_DELAY_SECONDS = 5
+BATCH_SIZE = 4  # kept small since a 3B model can lose structure across long JSON responses
+OLLAMA_CALL_DELAY_SECONDS = 0.5
 
 
-def check_logical_contradictions_batch(pairs: List[dict], max_retries: int = 3) -> dict:
+def check_logical_contradictions_batch(pairs: List[dict], max_retries: int = 2) -> dict:
     """
-    Evaluates MULTIPLE independent segment pairs in a single Gemini call.
+    Evaluates MULTIPLE independent segment pairs in a single local Ollama call.
     pairs: list of {"source_text": ..., "target_text": ...}
     Returns {"judge_error": bool, "verdicts": [...]} -- verdicts carry a
-    pair_index matching each pair's position in the input list. Retries with
-    backoff on rate-limit (429) errors before giving up.
+    pair_index matching each pair's position in the input list. Retries a
+    couple of times on transient failures (e.g. Ollama server hiccup or a
+    malformed response from the small model) before giving up -- there's no
+    external rate limit to back off from locally.
     """
     segments_block = "\n\n".join(
         f'--- Pair {i} ---\nSegment A: "{p["source_text"]}"\nSegment B: "{p["target_text"]}"'
@@ -398,33 +390,28 @@ def check_logical_contradictions_batch(pairs: List[dict], max_retries: int = 3) 
     4. Provide a professional compliance summary of the contradiction.
 
     Return exactly one verdict per pair, with pair_index set to that pair's N.
+    Respond with ONLY the JSON object, no other text.
     """
 
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model='gemini-2.0-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=BatchAuditReportSchema,
-                    temperature=0.1
-                )
+            response = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                format=BatchAuditReportSchema.model_json_schema(),
+                options={"temperature": 0.1}
             )
-            report_data = json.loads(response.text.strip())
-            return {"judge_error": False, "verdicts": report_data.get("verdicts", [])}
+            parsed = BatchAuditReportSchema.model_validate_json(response['message']['content'])
+            return {"judge_error": False, "verdicts": [v.model_dump() for v in parsed.verdicts]}
 
         except Exception as e:
             error_str = str(e)
-            is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+            print(f"[-] Ollama batch evaluation failure (attempt {attempt + 1}/{max_retries}): {error_str}")
 
-            if is_rate_limit and attempt < max_retries - 1:
-                wait = _extract_retry_delay(error_str)
-                print(f"[-] Rate limited on batch (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
-                time.sleep(wait)
+            if attempt < max_retries - 1:
+                time.sleep(2)
                 continue
 
-            print(f"[-] Batch evaluation failure: {e}")
             return {"judge_error": True, "judge_error_message": error_str, "verdicts": []}
 
 
