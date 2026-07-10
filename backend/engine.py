@@ -10,15 +10,17 @@ from dotenv import load_dotenv
 
 from pydantic import BaseModel, Field
 from typing import List
-import ollama
+from mistralai.client import Mistral
 
 from database import get_connection, setup_database
 
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=env_path, override=True)
 
-# Local LLM judge -- no API key, no quota, runs against your local Ollama server.
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+# LLM judge -- Mistral API (JSON mode + Pydantic validation, since Mistral's
+# JSON mode guarantees valid JSON but not an exact schema match).
+mistral_client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
+LLM_JUDGE_MODEL = os.getenv("LLM_JUDGE_MODEL", "mistral-small-latest")
 
 SUPABASE_URI = os.getenv("SUPABASE_URI")
 
@@ -251,16 +253,16 @@ def retry_pending_enrichment():
 
 def enrich_conflicts(edge_id: int):
     """
-    Runs the local Ollama LLM Judge over every un-enriched raw candidate for a
-    given edge, BATCHED (BATCH_SIZE pairs per call) for efficiency. Genuine
-    contradictions get upgraded in place with reasoning/summary/highlight
-    terms. False positives (vector-similar but not actually contradictory)
-    are deleted, so the triage view only ever surfaces judge-confirmed
-    conflicts. If a batch call fails outright (e.g. Ollama server down),
-    every row in that batch is left pending for a later retry via
-    retry_pending_enrichment(), rather than being discarded. Designed to be
-    called from a BackgroundTask so it never blocks the upload/deep-search
-    response.
+    Runs the Mistral LLM Judge over every un-enriched raw candidate for a
+    given edge, BATCHED (BATCH_SIZE pairs per call) to conserve requests.
+    Genuine contradictions get upgraded in place with reasoning/summary/
+    highlight terms. False positives (vector-similar but not actually
+    contradictory) are deleted, so the triage view only ever surfaces
+    judge-confirmed conflicts. If a batch call fails outright (e.g. rate
+    limit or invalid response exhausted after retries), every row in that
+    batch is left pending for a later retry via retry_pending_enrichment(),
+    rather than being discarded. Designed to be called from a BackgroundTask
+    so it never blocks the upload/deep-search response.
     """
     if not edge_id:
         return
@@ -283,7 +285,7 @@ def enrich_conflicts(edge_id: int):
 
             if result.get("judge_error", False):
                 print(f"[LLM JUDGE] Batch failed for rows {[r['id'] for r in batch]} -- left pending for retry.")
-                time.sleep(OLLAMA_CALL_DELAY_SECONDS)
+                time.sleep(MISTRAL_CALL_DELAY_SECONDS)
                 continue
 
             verdict_map = {v.get("pair_index"): v for v in result.get("verdicts", [])}
@@ -317,7 +319,7 @@ def enrich_conflicts(edge_id: int):
                     cur.execute(f"DELETE FROM {CONFLICT_TABLE} WHERE id = %s;", (row['id'],))
 
             conn.commit()
-            time.sleep(OLLAMA_CALL_DELAY_SECONDS)
+            time.sleep(MISTRAL_CALL_DELAY_SECONDS)
 
         print(f"[LLM JUDGE] Enrichment complete for edge {edge_id}.")
     except Exception as e:
@@ -357,19 +359,22 @@ class BatchAuditReportSchema(BaseModel):
     )
 
 
-BATCH_SIZE = 4  # kept small since a 3B model can lose structure across long JSON responses
-OLLAMA_CALL_DELAY_SECONDS = 0.5
+BATCH_SIZE = 6
+MISTRAL_CALL_DELAY_SECONDS = 1.5
 
 
-def check_logical_contradictions_batch(pairs: List[dict], max_retries: int = 2) -> dict:
+def check_logical_contradictions_batch(pairs: List[dict], max_retries: int = 3) -> dict:
     """
-    Evaluates MULTIPLE independent segment pairs in a single local Ollama call.
+    Evaluates MULTIPLE independent segment pairs in a single Mistral call.
     pairs: list of {"source_text": ..., "target_text": ...}
     Returns {"judge_error": bool, "verdicts": [...]} -- verdicts carry a
-    pair_index matching each pair's position in the input list. Retries a
-    couple of times on transient failures (e.g. Ollama server hiccup or a
-    malformed response from the small model) before giving up -- there's no
-    external rate limit to back off from locally.
+    pair_index matching each pair's position in the input list.
+
+    Mistral's response_format={"type": "json_object"} guarantees syntactically
+    valid JSON but NOT an exact schema match, so the expected shape is spelled
+    out explicitly in the prompt and the response is validated against
+    BatchAuditReportSchema afterward -- a validation failure is treated the
+    same as any other judge_error (retryable, then left pending).
     """
     segments_block = "\n\n".join(
         f'--- Pair {i} ---\nSegment A: "{p["source_text"]}"\nSegment B: "{p["target_text"]}"'
@@ -389,29 +394,52 @@ def check_logical_contradictions_batch(pairs: List[dict], max_retries: int = 2) 
     3. Isolate the 2-3 core sentences from each segment that show the actual conflict area.
     4. Provide a professional compliance summary of the contradiction.
 
-    Return exactly one verdict per pair, with pair_index set to that pair's N.
-    Respond with ONLY the JSON object, no other text.
+    Respond with ONLY a single JSON object (no other text, no markdown fences) with exactly this shape:
+    {{
+      "verdicts": [
+        {{
+          "pair_index": <integer, matching the Pair N above>,
+          "is_contradiction": <true or false>,
+          "reasoning": "<detailed compliance explanation>",
+          "highlight_terms_a": ["<term>", "..."],
+          "highlight_terms_b": ["<term>", "..."],
+          "isolated_summary_a": "<2-3 critical lines from Segment A>",
+          "isolated_summary_b": "<2-3 critical lines from Segment B>"
+        }}
+      ]
+    }}
+    Include exactly one verdict object per pair given above.
     """
 
     for attempt in range(max_retries):
         try:
-            response = ollama.chat(
-                model=OLLAMA_MODEL,
+            response = mistral_client.chat.complete(
+                model=LLM_JUDGE_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                format=BatchAuditReportSchema.model_json_schema(),
-                options={"temperature": 0.1}
+                response_format={"type": "json_object"},
+                temperature=0.1
             )
-            parsed = BatchAuditReportSchema.model_validate_json(response['message']['content'])
+
+            content = response.choices[0].message.content
+            parsed = BatchAuditReportSchema.model_validate_json(content)
             return {"judge_error": False, "verdicts": [v.model_dump() for v in parsed.verdicts]}
 
         except Exception as e:
             error_str = str(e)
-            print(f"[-] Ollama batch evaluation failure (attempt {attempt + 1}/{max_retries}): {error_str}")
+            is_rate_limit = "429" in error_str or "rate" in error_str.lower()
 
-            if attempt < max_retries - 1:
+            if is_rate_limit and attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"[-] Rate limited on batch (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            elif attempt < max_retries - 1:
+                # Likely a schema validation failure on a malformed response -- retry once.
+                print(f"[-] Batch response invalid (attempt {attempt + 1}/{max_retries}): {error_str}")
                 time.sleep(2)
                 continue
 
+            print(f"[-] Batch evaluation failure: {e}")
             return {"judge_error": True, "judge_error_message": error_str, "verdicts": []}
 
 
