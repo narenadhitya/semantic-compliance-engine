@@ -4,9 +4,289 @@ import axios from 'axios';
 import { API_BASE_URL } from './config';
 import './App.css';
 
+// ─────────────────────────────────────────────────────────────────
+// NEON HIGHLIGHT PARSER
+// Takes plain text + an array of terms to highlight, returns
+// an array of React elements with matching spans glowing red.
+// ─────────────────────────────────────────────────────────────────
+function NeonText({ text, terms = [] }) {
+  if (!text) return null;
+  if (!terms || terms.length === 0) return <>{text}</>;
+
+  const escaped = terms
+    .filter(Boolean)
+    .map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (escaped.length === 0) return <>{text}</>;
+
+  const pattern = new RegExp(`(${escaped.join('|')})`, 'gi');
+  const parts = text.split(pattern);
+  // Every odd-index element after split with a capture group IS a match
+  return (
+    <>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <span
+            key={i}
+            style={{
+              color: '#ef4444',
+              textShadow: '0 0 8px rgba(239, 68, 68, 0.6)',
+              fontWeight: 'bold',
+            }}
+          >
+            {part}
+          </span>
+        ) : (
+          <span key={i}>{part}</span>
+        )
+      )}
+    </>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// CONFLICT CARD  — the full investigation panel card
+// ─────────────────────────────────────────────────────────────────
+function ConflictCard({ conflict, idx, sourceDoc, targetDoc, onDismiss, onFlag }) {
+  const [actionState, setActionState] = useState(conflict.status || 'active'); // active | dismissed | flagged
+  const [loading, setLoading] = useState(null); // 'dismiss' | 'flag' | null
+
+  // Parse highlight terms (stored as JSON string from DB)
+  const parseTerms = (raw) => {
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw;
+    try { return JSON.parse(raw); } catch { return []; }
+  };
+
+  const termsA = parseTerms(conflict.highlight_terms_a);
+  const termsB = parseTerms(conflict.highlight_terms_b);
+
+  // Drift score — lower = higher semantic tension
+  const drift = typeof conflict.drift_score === 'number' ? conflict.drift_score : null;
+  const driftPct = drift !== null ? Math.round((1 - drift) * 100) : null;
+
+  const handleDismiss = async () => {
+    setLoading('dismiss');
+    try {
+      await axios.patch(`${API_BASE_URL}/api/conflicts/${conflict.id}/dismiss`);
+      setActionState('dismissed');
+      setTimeout(() => onDismiss(conflict.id), 600);
+    } catch (e) {
+      console.error('Dismiss failed:', e);
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const handleFlag = async () => {
+    setLoading('flag');
+    try {
+      await axios.patch(`${API_BASE_URL}/api/conflicts/${conflict.id}/flag`);
+      setActionState('flagged');
+      onFlag(conflict.id);
+    } catch (e) {
+      console.error('Flag failed:', e);
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const isFlagged = actionState === 'flagged';
+  const isDismissed = actionState === 'dismissed';
+
+  return (
+    <div
+      style={{
+        border: `1px solid ${isFlagged ? 'rgba(201,154,74,0.45)' : 'rgba(40,50,62,1)'}`,
+        borderRadius: '10px',
+        background: '#12181f',
+        marginBottom: '20px',
+        overflow: 'hidden',
+        opacity: isDismissed ? 0.35 : 1,
+        transform: isDismissed ? 'scale(0.97)' : 'scale(1)',
+        transition: 'opacity 0.5s ease, transform 0.5s ease, border-color 0.3s ease',
+        animationDelay: `${idx * 0.07}s`,
+        animation: 'cardIn .35s ease forwards',
+      }}
+    >
+      {/* Card Header: index + severity + drift */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '10px 14px', borderBottom: '1px solid #1e2936',
+        background: '#0d1117',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: '9.5px',
+            textTransform: 'uppercase', letterSpacing: '0.5px', color: '#586170',
+          }}>#{idx + 1} Structural Contradiction</span>
+          {isFlagged && (
+            <span style={{
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: '9px',
+              background: 'rgba(201,154,74,0.15)', color: '#c99a4a',
+              border: '1px solid rgba(201,154,74,0.35)', borderRadius: '10px',
+              padding: '2px 8px', letterSpacing: '0.5px',
+            }}>FLAGGED FOR REVISION</span>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {driftPct !== null && (
+            <span style={{
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: '10px',
+              color: '#ef4444', background: 'rgba(239,68,68,0.1)',
+              border: '1px solid rgba(239,68,68,0.25)', borderRadius: '4px',
+              padding: '2px 7px',
+              title: 'Semantic tension score',
+            }}>⚡ {driftPct}% tension</span>
+          )}
+          <span style={{
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: '9.5px',
+            textTransform: 'uppercase', letterSpacing: '0.5px',
+            padding: '3px 8px', borderRadius: '12px', fontWeight: 500,
+            background: 'rgba(198,86,74,0.15)', color: '#c6564a',
+            border: '1px solid rgba(198,86,74,0.35)',
+          }}>High</span>
+        </div>
+      </div>
+
+      {/* SECTION 2: AI VERDICT BANNER */}
+      {conflict.reasoning && (
+        <div style={{
+          margin: '14px 14px 0',
+          padding: '12px 14px',
+          background: 'rgba(239,68,68,0.06)',
+          border: '1px solid rgba(239,68,68,0.2)',
+          borderLeft: '3px solid #ef4444',
+          borderRadius: '6px',
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '6px',
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: '9px',
+            textTransform: 'uppercase', letterSpacing: '1px',
+            color: '#ef4444', marginBottom: '8px',
+          }}>
+            <span style={{
+              width: '5px', height: '5px', borderRadius: '50%',
+              background: '#ef4444', display: 'inline-block',
+              boxShadow: '0 0 6px rgba(239,68,68,0.6)',
+            }}></span>
+            AI Compliance Verdict
+          </div>
+          <div style={{
+            fontSize: '12px', lineHeight: '1.65', color: '#c5cdd6',
+          }}>
+            {conflict.reasoning}
+          </div>
+        </div>
+      )}
+
+      {/* SECTION 3 + 4: ISOLATED SUMMARIES WITH NEON HIGHLIGHTS */}
+      <div style={{ padding: '14px 14px 0' }}>
+        <div style={{
+          fontFamily: "'IBM Plex Mono', monospace", fontSize: '9px',
+          textTransform: 'uppercase', letterSpacing: '0.8px',
+          color: '#586170', marginBottom: '10px',
+        }}>Isolated Blast Radius</div>
+
+        {/* Side-by-side summary cards */}
+        <div style={{ display: 'flex', gap: '10px', marginBottom: '14px' }}>
+          {/* Summary A */}
+          <div style={{
+            flex: 1, background: '#0d1117', border: '1px solid #1e2936',
+            borderRadius: '7px', padding: '12px',
+          }}>
+            <div style={{
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: '9px',
+              textTransform: 'uppercase', letterSpacing: '0.5px',
+              color: '#4c9a6d', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '5px',
+            }}>
+              <span style={{ width: '5px', height: '5px', borderRadius: '50%', background: '#4c9a6d', display: 'inline-block' }}></span>
+              {sourceDoc?.split('.')[0] ?? 'Source'}
+            </div>
+            <div style={{ fontSize: '12px', lineHeight: '1.6', color: '#8b95a1' }}>
+              <NeonText
+                text={conflict.isolated_summary_a || conflict.source_text}
+                terms={termsA}
+              />
+            </div>
+          </div>
+
+          {/* Summary B */}
+          <div style={{
+            flex: 1, background: '#0d1117', border: '1px solid #2a1e1e',
+            borderRadius: '7px', padding: '12px',
+          }}>
+            <div style={{
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: '9px',
+              textTransform: 'uppercase', letterSpacing: '0.5px',
+              color: '#c6564a', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '5px',
+            }}>
+              <span style={{ width: '5px', height: '5px', borderRadius: '50%', background: '#c6564a', display: 'inline-block' }}></span>
+              {targetDoc?.split('.')[0] ?? 'Target'}
+            </div>
+            <div style={{ fontSize: '12px', lineHeight: '1.6', color: '#8b95a1' }}>
+              <NeonText
+                text={conflict.isolated_summary_b || conflict.target_text}
+                terms={termsB}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION 5: RESOLUTION ACTIONS */}
+      <div style={{
+        display: 'flex', gap: '8px', padding: '12px 14px',
+        borderTop: '1px solid #1e2936', background: '#0a0f14',
+      }}>
+        {/* Dismiss / False Positive */}
+        <button
+          id={`btn-dismiss-${conflict.id}`}
+          onClick={handleDismiss}
+          disabled={loading !== null || isDismissed || isFlagged}
+          style={{
+            flex: 1, padding: '9px 0', border: '1px solid #28323e',
+            borderRadius: '6px', background: 'transparent',
+            color: isDismissed ? '#586170' : '#8b95a1',
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: '10.5px',
+            letterSpacing: '0.3px', cursor: loading !== null || isDismissed || isFlagged ? 'not-allowed' : 'pointer',
+            transition: 'all 0.2s', opacity: isDismissed || isFlagged ? 0.5 : 1,
+          }}
+          onMouseEnter={(e) => { if (!loading && !isDismissed && !isFlagged) { e.currentTarget.style.borderColor = '#586170'; e.currentTarget.style.color = '#e8eaed'; } }}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#28323e'; e.currentTarget.style.color = isDismissed ? '#586170' : '#8b95a1'; }}
+        >
+          {loading === 'dismiss' ? '...' : isDismissed ? '✓ Dismissed' : '✗ Dismiss · False Positive'}
+        </button>
+
+        {/* Flag for Revision */}
+        <button
+          id={`btn-flag-${conflict.id}`}
+          onClick={handleFlag}
+          disabled={loading !== null || isDismissed || isFlagged}
+          style={{
+            flex: 1, padding: '9px 0',
+            border: `1px solid ${isFlagged ? 'rgba(201,154,74,0.6)' : 'rgba(198,86,74,0.35)'}`,
+            borderRadius: '6px',
+            background: isFlagged ? 'rgba(201,154,74,0.08)' : 'rgba(198,86,74,0.08)',
+            color: isFlagged ? '#c99a4a' : '#c6564a',
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: '10.5px',
+            letterSpacing: '0.3px', cursor: loading !== null || isDismissed || isFlagged ? 'not-allowed' : 'pointer',
+            transition: 'all 0.2s', opacity: isDismissed ? 0.5 : 1,
+            fontWeight: 600,
+          }}
+          onMouseEnter={(e) => { if (!loading && !isDismissed && !isFlagged) { e.currentTarget.style.background = 'rgba(198,86,74,0.16)'; } }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = isFlagged ? 'rgba(201,154,74,0.08)' : 'rgba(198,86,74,0.08)'; }}
+        >
+          {loading === 'flag' ? '...' : isFlagged ? '⚑ Flagged for Revision' : '⚑ Flag for Revision'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [documents, setDocuments] = useState([]);
   const [graphData, setGraphData] = useState({ nodes: [], links: [] });
+  const [triagePairs, setTriagePairs] = useState([]);  // conflict pairs for inbox
   const [selectedEdge, setSelectedEdge] = useState(null);
   const [conflicts, setConflicts] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -38,9 +318,10 @@ export default function App() {
 
   const loadWorkspace = async () => {
     try {
-      const [docRes, graphRes] = await Promise.all([
+      const [docRes, graphRes, triageRes] = await Promise.all([
         axios.get(`${API_BASE_URL}/api/documents`),
-        axios.get(`${API_BASE_URL}/api/graph`)
+        axios.get(`${API_BASE_URL}/api/graph`),
+        axios.get(`${API_BASE_URL}/api/triage/pairs`),
       ]);
 
       const nextGraph = graphRes.data?.data ?? graphRes.data ?? { nodes: [], links: [] };
@@ -49,6 +330,7 @@ export default function App() {
         nodes: Array.isArray(nextGraph.nodes) ? nextGraph.nodes : [],
         links: Array.isArray(nextGraph.links) ? nextGraph.links : []
       });
+      setTriagePairs(Array.isArray(triageRes.data?.pairs) ? triageRes.data.pairs : []);
     } catch (error) {
       console.error('SYSTEM FAILURE: Unable to map database topology.', error);
     } finally {
@@ -137,22 +419,25 @@ export default function App() {
     }
   };
 
-  const handleLinkClick = async (link) => {
-    const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
-    const targetId = typeof link.target === 'object' ? link.target.id : link.target;
-    
+  // Opens the investigation drawer — works for graph link clicks AND inbox pair clicks
+  const openInspectDrawer = async (sourceId, targetId) => {
     setSelectedEdge({ source: sourceId, target: targetId });
     setDrawerOpen(true);
-    setConflicts([]); 
-    
+    setConflicts([]);
     try {
       const res = await axios.get(`${API_BASE_URL}/api/investigate`, {
         params: { source: sourceId, target: targetId }
       });
       setConflicts(Array.isArray(res.data?.conflicts) ? res.data.conflicts : []);
     } catch (error) {
-      console.error("Failed to retrieve conflict vectors:", error);
+      console.error('Failed to retrieve conflict vectors:', error);
     }
+  };
+
+  const handleLinkClick = (link) => {
+    const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
+    const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+    openInspectDrawer(sourceId, targetId);
   };
 
   const closeDrawer = () => {
@@ -196,17 +481,10 @@ export default function App() {
     ctx.fillText(label, node.x, node.y + 12);
   };
 
-  // INBOX LOGIC: Filter links based on search query
-  const filteredInboxLinks = graphData.links.filter(link => {
-    const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
-    const targetId = typeof link.target === 'object' ? link.target.id : link.target;
-    const searchLower = searchQuery.toLowerCase();
-    return sourceId.toLowerCase().includes(searchLower) || targetId.toLowerCase().includes(searchLower);
-  }).sort((a, b) => {
-    // Sort logic: Conflicts bubble to the top
-    if (a.has_conflict && !b.has_conflict) return -1;
-    if (!a.has_conflict && b.has_conflict) return 1;
-    return 0;
+  // INBOX LOGIC: Filter triage pairs by search query
+  const filteredPairs = triagePairs.filter(pair => {
+    const s = searchQuery.toLowerCase();
+    return pair.source_doc.toLowerCase().includes(s) || pair.target_doc.toLowerCase().includes(s);
   });
 
   const handleToggleRow = (idx) => {
@@ -217,8 +495,8 @@ export default function App() {
   };
 
   const handleToggleAll = () => {
-    if (selectedRows.size === filteredInboxLinks.length) setSelectedRows(new Set());
-    else setSelectedRows(new Set(filteredInboxLinks.map((_, i) => i)));
+    if (selectedRows.size === filteredPairs.length) setSelectedRows(new Set());
+    else setSelectedRows(new Set(filteredPairs.map((_, i) => i)));
   };
 
   return (
@@ -276,8 +554,8 @@ export default function App() {
           <div className="sidebar-inner">
             <div className="stats-row">
               <div className="stat"><div className="stat-num">{documents.length}</div><div className="stat-label">Documents</div></div>
-              <div className="stat conflict"><div className="stat-num">{graphData.links.filter(l => l.has_conflict).length}</div><div className="stat-label">Conflicts</div></div>
-              <div className="stat warning"><div className="stat-num">0</div><div className="stat-label">Review</div></div>
+              <div className="stat conflict"><div className="stat-num">{triagePairs.length}</div><div className="stat-label">Conflict Pairs</div></div>
+              <div className="stat warning"><div className="stat-num">{graphData.links.filter(l => l.has_conflict).length}</div><div className="stat-label">Graph Edges</div></div>
             </div>
 
             <input ref={fileInputRef} type="file" multiple accept=".txt,.pdf,.docx" className="hidden" style={{display: 'none'}} onChange={handleFileUpload} />
@@ -295,21 +573,20 @@ export default function App() {
             </div>
 
             <div className="file-list">
-              <div className="file-group-label">Active Registry</div>
+              <div className="file-group-label">Document Registry</div>
               {documents.length === 0 ? (
                 <div style={{padding: '10px 8px', fontSize: '11px', color: '#586170', fontStyle: 'italic'}}>No infrastructure mapped.</div>
               ) : (
                 documents.map((doc, idx) => {
                   const docName = typeof doc === 'string' ? doc : doc.document_name;
-                  const isActive = typeof doc === 'string' ? true : doc.is_active;
 
                   return (
-                    <div key={idx} className="file-row" style={{ opacity: isActive ? 1 : 0.4, position: 'relative' }}>
-                      <span className={`health-dot ${isActive ? 'healthy' : 'warning'}`}></span>
+                    <div key={idx} className="file-row" style={{ position: 'relative' }}>
+                      <span className="health-dot healthy"></span>
                       <span className="file-icon">▤</span>
                       <div className="file-meta" style={{ flex: 1, minWidth: 0 }}>
                         <div className="file-name">{docName}</div>
-                        <div className="file-date mono">{isActive ? 'Active Node' : 'Archived Delta'}</div>
+                        <div className="file-date mono">Indexed</div>
                       </div>
 
                       <div style={{ position: 'relative' }}>
@@ -361,27 +638,13 @@ export default function App() {
                               style={{
                                 padding: '8px 10px', fontSize: '11px', color: '#c6564a', cursor: 'pointer', 
                                 display: 'flex', alignItems: 'center', gap: '6px', borderRadius: '4px',
-                                transition: 'background 0.15s', marginBottom: '2px'
+                                transition: 'background 0.15s'
                               }}
                               onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(198, 86, 74, 0.1)'}
                               onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
                             >
                               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
                               Destroy File
-                            </div>
-                            
-                            <div 
-                              onClick={(e) => { e.stopPropagation(); setActiveMenu(null); }}
-                              style={{
-                                padding: '8px 10px', fontSize: '11px', color: '#8b95a1', cursor: 'pointer', 
-                                display: 'flex', alignItems: 'center', gap: '6px', borderRadius: '4px',
-                                transition: 'background 0.15s'
-                              }}
-                              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#212b38'}
-                              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-                            >
-                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="4" width="20" height="5" rx="2" ry="2"></rect><path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9"></path><line x1="10" y1="13" x2="14" y2="13"></line></svg>
-                              Archive Record
                             </div>
                           </div>
                         )}
@@ -443,91 +706,123 @@ export default function App() {
           ) : (
              /* THE TRIAGE INBOX VIEW */
              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', paddingTop: '60px', overflow: 'hidden' }}>
-                {/* Inbox Toolbar Stubs */}
+                {/* Inbox Toolbar */}
                 <div style={{ padding: '0 20px 15px 20px', display: 'flex', gap: '10px', alignItems: 'center', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
                   <div className="sidebar-search" style={{ margin: 0, flex: 1, maxWidth: '400px' }}>
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8b95a1" strokeWidth="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
                     <input 
                       type="text" 
-                      placeholder="Filter pairs (e.g., GDPR)..." 
+                      placeholder="Filter by document name..." 
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
                     />
                   </div>
-                  <button className="btn" style={{ fontSize: '11px' }}>Status: All ▾</button>
-                  <button className="btn" style={{ fontSize: '11px' }}>Severity: Any ▾</button>
-                  <button className="btn" style={{ fontSize: '11px' }}>Department: Any ▾</button>
                   <div style={{ flex: 1 }}></div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: '11px', color: '#586170' }}>
+                    {filteredPairs.length} conflict pair{filteredPairs.length !== 1 ? 's' : ''}
+                  </div>
                   {selectedRows.size > 0 && (
                     <button className="btn" style={{ fontSize: '11px', color: '#c6564a', borderColor: 'rgba(198,86,74,0.3)' }}>Bulk Dismiss ({selectedRows.size})</button>
                   )}
                 </div>
 
                 {/* Inbox Table Header */}
-                <div style={{ display: 'flex', padding: '12px 20px', borderBottom: '1px solid var(--border)', background: 'var(--surface-2)', fontSize: '11px', color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.5px' }} className="mono">
-                  <div style={{ width: '40px' }}>
-                    <input type="checkbox" onChange={handleToggleAll} checked={selectedRows.size === filteredInboxLinks.length && filteredInboxLinks.length > 0} />
+                <div style={{ display: 'flex', padding: '10px 20px', borderBottom: '1px solid var(--border)', background: 'var(--surface-2)', fontSize: '10.5px', color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.5px' }} className="mono">
+                  <div style={{ width: '36px' }}>
+                    <input type="checkbox" onChange={handleToggleAll} checked={selectedRows.size === filteredPairs.length && filteredPairs.length > 0} />
                   </div>
-                  <div style={{ width: '80px' }}>Severity</div>
-                  <div style={{ flex: 1 }}>Semantic Relationship Pair</div>
-                  <div style={{ width: '120px' }}>Recency</div>
+                  <div style={{ width: '90px' }}>Severity</div>
+                  <div style={{ flex: 1 }}>Document Conflict Pair</div>
+                  <div style={{ width: '90px' }}>Conflicts</div>
+                  <div style={{ width: '130px' }}>Last Detected</div>
                   <div style={{ width: '100px', textAlign: 'right' }}>Action</div>
                 </div>
 
-                {/* Inbox Table Body (Virtualized scrolling placeholder via overflow) */}
+                {/* Inbox Table Body */}
                 <div style={{ flex: 1, overflowY: 'auto' }} className="custom-scrollbar">
-                  {filteredInboxLinks.length === 0 ? (
-                    <div style={{ textAlign: 'center', padding: '50px', color: 'var(--text-faint)', fontSize: '13px' }}>
-                      No compliance pairs match your filter.
+                  {filteredPairs.length === 0 ? (
+                    <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-faint)', fontSize: '13px' }}>
+                      <div style={{ fontSize: '28px', marginBottom: '12px', opacity: 0.2 }}>⊘</div>
+                      {triagePairs.length === 0
+                        ? 'No confirmed conflict pairs yet. Upload documents and run a deep search.'
+                        : 'No pairs match your filter.'}
                     </div>
                   ) : (
-                    filteredInboxLinks.map((link, idx) => {
-                      const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
-                      const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+                    filteredPairs.map((pair, idx) => {
                       const isSelected = selectedRows.has(idx);
+                      // Convert ISO timestamp → relative or formatted string
+                      const detectedAt = pair.latest_at
+                        ? new Date(pair.latest_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+                        : '—';
+                      const tensionPct = pair.min_drift !== null
+                        ? Math.round((1 - pair.min_drift) * 100)
+                        : null;
 
                       return (
-                        <div 
-                          key={idx} 
-                          style={{ 
-                            display: 'flex', alignItems: 'center', padding: '12px 20px', 
-                            borderBottom: '1px solid var(--border)', 
-                            background: isSelected ? 'rgba(111,168,201,0.05)' : 'transparent',
+                        <div
+                          key={`${pair.source_doc}-${pair.target_doc}`}
+                          style={{
+                            display: 'flex', alignItems: 'center', padding: '13px 20px',
+                            borderBottom: '1px solid var(--border)',
+                            background: isSelected ? 'rgba(198,86,74,0.04)' : 'transparent',
                             transition: 'background 0.15s'
                           }}
-                          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = isSelected ? 'rgba(111,168,201,0.08)' : 'var(--surface-2)'}
-                          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = isSelected ? 'rgba(111,168,201,0.05)' : 'transparent'}
+                          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = isSelected ? 'rgba(198,86,74,0.06)' : 'var(--surface-2)'}
+                          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = isSelected ? 'rgba(198,86,74,0.04)' : 'transparent'}
                         >
                           {/* Checkbox */}
-                          <div style={{ width: '40px' }}>
+                          <div style={{ width: '36px' }}>
                             <input type="checkbox" checked={isSelected} onChange={() => handleToggleRow(idx)} />
                           </div>
 
-                          {/* Severity Indicator */}
-                          <div style={{ width: '80px', display: 'flex', alignItems: 'center', gap: '6px' }} className="mono">
-                            {link.has_conflict ? (
-                               <><span style={{ color: '#c6564a', fontSize: '14px' }}>🔴</span> <span style={{ color: '#c6564a', fontSize: '11px' }}>High</span></>
-                            ) : (
-                               <><span style={{ color: '#4c9a6d', fontSize: '14px' }}>🟢</span> <span style={{ color: '#4c9a6d', fontSize: '11px' }}>Aligned</span></>
+                          {/* Severity */}
+                          <div style={{ width: '90px', display: 'flex', alignItems: 'center', gap: '6px' }} className="mono">
+                            <span style={{ color: '#c6564a', fontSize: '14px' }}>🔴</span>
+                            <span style={{ color: '#c6564a', fontSize: '11px' }}>High</span>
+                          </div>
+
+                          {/* Document pair */}
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} className="mono">
+                              <span style={{ fontSize: '12px', color: '#e8eaed', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '160px' }} title={pair.source_doc}>
+                                {pair.source_doc}
+                              </span>
+                              <span style={{ color: '#c6564a', fontSize: '12px', flexShrink: 0 }}>⟷</span>
+                              <span style={{ fontSize: '12px', color: '#c99a4a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '160px' }} title={pair.target_doc}>
+                                {pair.target_doc}
+                              </span>
+                            </div>
+                            {tensionPct !== null && (
+                              <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: '10px', color: '#ef4444', marginTop: '3px' }}>
+                                ⚡ {tensionPct}% semantic tension
+                              </div>
                             )}
                           </div>
 
-                          {/* Relationship Text */}
-                          <div style={{ flex: 1, fontSize: '13px', color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} className="mono">
-                            {sourceId} <span style={{ color: 'var(--text-faint)', margin: '0 8px' }}>⟷</span> {targetId}
+                          {/* Conflict count badge */}
+                          <div style={{ width: '90px' }}>
+                            <span style={{
+                              fontFamily: "'IBM Plex Mono', monospace", fontSize: '11px',
+                              background: 'rgba(198,86,74,0.12)', color: '#c6564a',
+                              border: '1px solid rgba(198,86,74,0.3)', borderRadius: '4px',
+                              padding: '2px 8px'
+                            }}>
+                              {pair.conflict_count} found
+                            </span>
                           </div>
 
-                          {/* Mock Recency */}
-                          <div style={{ width: '120px', fontSize: '11.5px', color: 'var(--text-muted)' }}>
-                            {link.has_conflict ? '2 days ago' : '1 wk ago'}
+                          {/* Date */}
+                          <div style={{ width: '130px', fontSize: '11px', color: 'var(--text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}>
+                            {detectedAt}
                           </div>
 
-                          {/* Action Button */}
+                          {/* Inspect button */}
                           <div style={{ width: '100px', textAlign: 'right' }}>
-                            <button 
-                              onClick={() => handleLinkClick(link)}
-                              className="btn" 
-                              style={{ display: 'inline-flex', background: 'transparent', borderColor: 'var(--border)', fontSize: '11px', padding: '4px 8px' }}
+                            <button
+                              id={`inbox-inspect-${idx}`}
+                              onClick={() => openInspectDrawer(pair.source_doc, pair.target_doc)}
+                              className="btn"
+                              style={{ display: 'inline-flex', background: 'transparent', borderColor: 'rgba(198,86,74,0.4)', color: '#c6564a', fontSize: '11px', padding: '4px 8px' }}
                             >
                               [Inspect →]
                             </button>
@@ -541,66 +836,99 @@ export default function App() {
           )}
         </div>
 
-        {/* DRAWER (Investigation Panel) - Operates for BOTH views */}
+        {/* DRAWER (Investigation Panel) */}
         <div className={`drawer ${drawerOpen ? 'open' : ''}`} id="drawer">
           {selectedEdge && (
             <div className="drawer-inner">
-              <div className="drawer-header">
-                <div style={{maxWidth: '90%'}}>
-                  <div className="drawer-header-title mono" style={{fontSize: '13px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'}}>
-                    {selectedEdge.source} ⟷
+
+              {/* ── SECTION 1: THE CLASH HEADER ── */}
+              <div style={{
+                padding: '18px 20px 14px',
+                borderBottom: '1px solid #28323e',
+                background: '#0d1117',
+                flexShrink: 0,
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+              }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{
+                    fontFamily: "'IBM Plex Mono', monospace",
+                    fontSize: '9px',
+                    letterSpacing: '1px',
+                    textTransform: 'uppercase',
+                    color: '#c6564a',
+                    marginBottom: '10px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px'
+                  }}>
+                    <span style={{ display: 'inline-block', width: '6px', height: '6px', borderRadius: '50%', background: '#c6564a', boxShadow: '0 0 6px rgba(198,86,74,0.8)' }}></span>
+                    Conflict Investigation
                   </div>
-                  <div className="drawer-header-title mono" style={{fontSize: '13px', color: '#c99a4a', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'}}>
-                    {selectedEdge.target}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span style={{
+                      fontFamily: "'IBM Plex Mono', monospace",
+                      fontSize: '11.5px',
+                      color: '#e8eaed',
+                      background: '#1c2430',
+                      border: '1px solid #2e3d4e',
+                      borderRadius: '4px',
+                      padding: '4px 8px',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      maxWidth: '160px',
+                    }} title={selectedEdge.source}>{selectedEdge.source}</span>
+                    <span style={{ color: '#c6564a', fontSize: '14px', flexShrink: 0 }}>⟷</span>
+                    <span style={{
+                      fontFamily: "'IBM Plex Mono', monospace",
+                      fontSize: '11.5px',
+                      color: '#c99a4a',
+                      background: '#1c2430',
+                      border: '1px solid #3a2e1a',
+                      borderRadius: '4px',
+                      padding: '4px 8px',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      maxWidth: '160px',
+                    }} title={selectedEdge.target}>{selectedEdge.target}</span>
+                  </div>
+                  <div style={{
+                    fontFamily: "'IBM Plex Mono', monospace",
+                    fontSize: '10px',
+                    color: '#586170',
+                    marginTop: '8px'
+                  }}>
+                    {conflicts.length} confirmed contradiction{conflicts.length !== 1 ? 's' : ''} detected
                   </div>
                 </div>
-                <button className="drawer-close" onClick={closeDrawer}>×</button>
+                <button className="drawer-close" onClick={closeDrawer} style={{ flexShrink: 0, marginLeft: '8px' }}>×</button>
               </div>
 
-              <div className="drawer-pager">
-                <div className="drawer-pager-label">Conflicts: {conflicts.length}</div>
-              </div>
-
-              <div className="drawer-body">
+              {/* ── BODY: SCROLLABLE CONFLICT CARDS ── */}
+              <div className="drawer-body custom-scrollbar">
                 {conflicts.length === 0 ? (
-                  <div style={{color: '#8b95a1', fontSize: '12px', textAlign: 'center', marginTop: '40px'}}>
+                  <div style={{ color: '#8b95a1', fontSize: '12px', textAlign: 'center', marginTop: '60px', fontFamily: "'IBM Plex Mono', monospace" }}>
+                    <div style={{ fontSize: '24px', marginBottom: '12px', opacity: 0.3 }}>⧖</div>
                     Awaiting server telemetry...
                   </div>
                 ) : (
                   conflicts.map((conflict, idx) => (
-                    <div key={idx} className="conflict-card" style={{animationDelay: `${idx * 0.05}s`}}>
-                      <div className="card-header">
-                        <span className="mono" style={{fontSize: '11px', color: '#8b95a1'}}>Structural Contradiction</span>
-                        <span className="severity-badge high">High</span>
-                      </div>
-                      
-                      <div className="excerpt-block">
-                        <div className="excerpt">
-                          <div className="excerpt-doc">Base Logic</div>
-                          <div className="excerpt-text">{conflict.source_text}</div>
-                        </div>
-                        <div className="excerpt">
-                          <div className="excerpt-doc" style={{color: '#c6564a'}}>Contradicting Logic</div>
-                          <div className="excerpt-text">{conflict.target_text}</div>
-                        </div>
-                      </div>
-
-                      {conflict.llm_analysis && (
-                        <div className="verdict-block">
-                          <div className="verdict-label"><span className="verdict-dot"></span> AI Judge verdict</div>
-                          <div className="verdict-line">{conflict.llm_analysis}</div>
-                        </div>
-                      )}
-
-                      <div className="card-actions">
-                        <button className="card-action">Mark reviewed</button>
-                        <button className="card-action">Flag for legal</button>
-                        <button className="card-action dismiss">Dismiss</button>
-                      </div>
-                    </div>
+                    <ConflictCard
+                      key={conflict.id ?? idx}
+                      conflict={conflict}
+                      idx={idx}
+                      sourceDoc={selectedEdge.source}
+                      targetDoc={selectedEdge.target}
+                      onDismiss={(id) => setConflicts(prev => prev.filter(c => c.id !== id))}
+                      onFlag={(id) => setConflicts(prev => prev.map(c => c.id === id ? { ...c, status: 'flagged' } : c))}
+                    />
                   ))
                 )}
               </div>
+
             </div>
           )}
         </div>

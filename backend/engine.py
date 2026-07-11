@@ -50,29 +50,27 @@ def get_base_name(filename: str):
     return base if base else name
 
 
-def handle_versioning(cur, new_doc_name: str):
-    """Deprecates old versions of a document and sets the new one to active."""
+def register_and_get_predecessors(cur, new_doc_name: str):
+    """
+    Tags the newly-uploaded document with its base_name (for grouping) and
+    returns ALL prior documents that share that base name -- no archival, no
+    is_active toggling. Every version stays permanently visible.
+    """
     base_name = get_base_name(new_doc_name)
 
+    # Stamp the new doc with its base_name so it can be grouped later.
     cur.execute(f"""
-        SELECT DISTINCT document_name FROM {TABLE_NAME}
-        WHERE base_name = %s AND document_name != %s AND is_active = TRUE;
-    """, (base_name, new_doc_name))
-    old_versions = cur.fetchall()
-
-    cur.execute(f"""
-        UPDATE {TABLE_NAME} SET is_active = FALSE
-        WHERE base_name = %s AND document_name != %s;
-    """, (base_name, new_doc_name))
-
-    cur.execute(f"""
-        UPDATE {TABLE_NAME} SET base_name = %s, is_active = TRUE
+        UPDATE {TABLE_NAME} SET base_name = %s
         WHERE document_name = %s;
     """, (base_name, new_doc_name))
 
-    if old_versions:
-        return old_versions[0]['document_name']
-    return None
+    # Return every prior doc that shares the same lineage.
+    cur.execute(f"""
+        SELECT DISTINCT document_name FROM {TABLE_NAME}
+        WHERE base_name = %s AND document_name != %s;
+    """, (base_name, new_doc_name))
+
+    return [row['document_name'] for row in cur.fetchall()]
 
 
 def _fetch_chunks_for_document(cur, document_name: str):
@@ -191,7 +189,7 @@ def compute_graph_edges(new_document_name: str):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        cur.execute(f"SELECT DISTINCT document_name FROM {TABLE_NAME} WHERE is_active = TRUE AND document_name != %s;", (new_document_name,))
+        cur.execute(f"SELECT DISTINCT document_name FROM {TABLE_NAME} WHERE document_name != %s;", (new_document_name,))
         other_docs = [row['document_name'] for row in cur.fetchall()]
 
         print(f"[GRAPH ENGINE] Deep search will evaluate {len(other_docs)} other active documents.")
@@ -453,7 +451,7 @@ def fetch_all_document_names():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     cur.execute(f"""
-        SELECT DISTINCT document_name, base_name, is_active
+        SELECT DISTINCT document_name, base_name
         FROM {TABLE_NAME}
         ORDER BY base_name ASC, document_name DESC;
     """)
@@ -465,20 +463,20 @@ def fetch_all_document_names():
 
 
 def fetch_graph_data():
-    """Graph view: ONLY active (latest-version) documents and the edges between them."""
+    """Graph view: ALL documents and ALL edges between them (no archival filter)."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    cur.execute(f"SELECT DISTINCT document_name as id FROM {TABLE_NAME} WHERE is_active = TRUE;")
+    cur.execute(f"SELECT DISTINCT document_name as id FROM {TABLE_NAME};")
     nodes = cur.fetchall()
-    active_docs = [n['id'] for n in nodes]
+    all_docs = [n['id'] for n in nodes]
 
-    if not active_docs:
+    if not all_docs:
         cur.close()
         conn.close()
         return {"nodes": [], "links": []}
 
-    format_strings = ','.join(['%s'] * len(active_docs))
+    format_strings = ','.join(['%s'] * len(all_docs))
     cur.execute(f"""
         SELECT e.source_doc as source, e.target_doc as target, e.max_similarity,
                COUNT(c.id) FILTER (WHERE c.reasoning IS NOT NULL) AS confirmed_conflict_count
@@ -486,14 +484,12 @@ def fetch_graph_data():
         LEFT JOIN {CONFLICT_TABLE} c ON c.edge_id = e.id
         WHERE e.source_doc IN ({format_strings}) AND e.target_doc IN ({format_strings})
         GROUP BY e.id, e.source_doc, e.target_doc, e.max_similarity;
-    """, tuple(active_docs) * 2)
+    """, tuple(all_docs) * 2)
     links = cur.fetchall()
 
     cur.close()
     conn.close()
 
-    # has_conflict now reflects ACTUAL judge-confirmed rows in detected_conflicts,
-    # not just topic-level similarity (an edge can exist without any conflict).
     for link in links:
         link['has_conflict'] = link['confirmed_conflict_count'] > 0
 
@@ -522,10 +518,7 @@ def fetch_conflicts(doc1: str, doc2: str):
 
 
 def fetch_all_conflicts():
-    """
-    Inbox Triage view: ALL confirmed conflicts across ALL documents, active or
-    deprecated -- unlike the graph view, this is not filtered to is_active.
-    """
+    """Inbox Triage view: ALL confirmed conflicts across ALL documents."""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -533,7 +526,7 @@ def fetch_all_conflicts():
         SELECT id, edge_id, source_doc, target_doc,
                source_text, target_text,
                reasoning, isolated_summary_a, isolated_summary_b,
-               highlight_terms_a, highlight_terms_b, drift_score, created_at
+               highlight_terms_a, highlight_terms_b, drift_score, created_at, status
         FROM {CONFLICT_TABLE}
         WHERE reasoning IS NOT NULL
         ORDER BY created_at DESC;
@@ -543,6 +536,36 @@ def fetch_all_conflicts():
     cur.close()
     conn.close()
     return conflicts
+
+
+def fetch_triage_pairs():
+    """
+    Returns one aggregated row per unique (source_doc, target_doc) pair that
+    has at least one judge-confirmed conflict. Used by the Triage Inbox view
+    so it shows document pairs (not individual conflict rows).
+    """
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute(f"""
+        SELECT
+            source_doc,
+            target_doc,
+            COUNT(*) AS conflict_count,
+            MIN(drift_score) AS min_drift,
+            MAX(created_at) AS latest_at
+        FROM {CONFLICT_TABLE}
+        WHERE reasoning IS NOT NULL
+        GROUP BY source_doc, target_doc
+        ORDER BY latest_at DESC;
+    """)
+
+    pairs = cur.fetchall()
+    cur.close()
+    conn.close()
+    return pairs
+
+
 
 
 def fetch_conflicts_by_edge(edge_id: int):
@@ -564,6 +587,38 @@ def fetch_conflicts_by_edge(edge_id: int):
     cur.close()
     conn.close()
     return conflicts
+
+
+def dismiss_conflict(conflict_id: int):
+    """Marks a conflict as a human-reviewed false positive and logs the override."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            UPDATE {CONFLICT_TABLE}
+            SET status = 'dismissed', reviewed_at = NOW()
+            WHERE id = %s;
+        """, (conflict_id,))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def flag_conflict(conflict_id: int):
+    """Escalates a conflict to the compliance team for document revision."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            UPDATE {CONFLICT_TABLE}
+            SET status = 'flagged', reviewed_at = NOW()
+            WHERE id = %s;
+        """, (conflict_id,))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 
 def delete_document(document_name: str):

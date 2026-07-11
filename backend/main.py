@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import engine
 from database import setup_database
 from sandbox import ingest_chunk_vectorize
+from engine import dismiss_conflict, flag_conflict, fetch_triage_pairs
 
 app = FastAPI(title="Semantic Compliance Engine API")
 
@@ -13,6 +14,17 @@ app = FastAPI(title="Semantic Compliance Engine API")
 @app.on_event("startup")
 def initialize_schema():
     setup_database()
+    # Ensure the status and reviewed_at columns exist (idempotent migration)
+    try:
+        conn = engine.get_db_connection()
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE detected_conflicts ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active';")
+        cur.execute("ALTER TABLE detected_conflicts ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[STARTUP] Migration warning: {e}")
 
 
 app.add_middleware(
@@ -36,12 +48,14 @@ def health_check():
 @app.post("/api/upload")
 async def upload_document(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
     """
-    PHASE 1: Ingestion and Local Delta Check.
-    Vector-only detection runs synchronously (it's fast). If it finds any
-    candidate conflicts against the previous version, the LLM enrichment pass
-    is scheduled as a background task so the upload response doesn't wait on
-    Gemini -- by the time the frontend calls /api/investigate, it's usually
-    already enriched.
+    Ingestion + Predecessor Delta Check.
+    1. Vectorises the uploaded file.
+    2. Registers its base_name and finds ALL prior versions of the same document
+       family WITHOUT archiving any of them.
+    3. Runs a synchronous vector-distance pass against every predecessor so
+       candidate conflicts land in the DB immediately.
+    4. Schedules LLM enrichment for each predecessor edge as a background task
+       so the HTTP response is never blocked on the LLM.
     """
     try:
         file_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -52,34 +66,33 @@ async def upload_document(file: UploadFile = File(...), background_tasks: Backgr
         ingest_chunk_vectorize(file_path)
         os.remove(file_path)
 
-        # 2. Database Version Routing
+        # 2. Register base_name, collect ALL predecessors (no archival)
         conn = engine.get_db_connection()
         cur = conn.cursor(cursor_factory=engine.RealDictCursor)
-        old_version = engine.handle_versioning(cur, file.filename)
+        predecessors = engine.register_and_get_predecessors(cur, file.filename)
         conn.commit()
         cur.close()
         conn.close()
 
-        # 3. Determine if Delta exists
-        if old_version:
-            edge_id = engine.compare_versions(file.filename, old_version)
+        # 3. Compare against every predecessor (vector pass is fast)
+        edge_ids = []
+        for predecessor in predecessors:
+            edge_id = engine.compare_versions(file.filename, predecessor)
             if edge_id:
+                edge_ids.append(edge_id)
                 background_tasks.add_task(engine.enrich_conflicts, edge_id)
 
-            return {
-                "status": "delta_checked",
-                "message": f"Delta check against {old_version} complete.",
-                "requires_deep_search": True,
-                "document_id": file.filename,
-                "edge_id": edge_id
-            }
-        else:
-            return {
-                "status": "new_document",
-                "message": "New document indexed.",
-                "requires_deep_search": True,
-                "document_id": file.filename
-            }
+        return {
+            "status": "delta_checked" if predecessors else "new_document",
+            "message": (
+                f"Delta check against {len(predecessors)} predecessor(s) complete."
+                if predecessors else "New document indexed."
+            ),
+            "requires_deep_search": True,
+            "document_id": file.filename,
+            "predecessor_count": len(predecessors),
+            "edge_ids": edge_ids
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -120,10 +133,25 @@ def get_knowledge_graph():
 
 @app.get("/api/triage")
 def get_triage_inbox():
-    """Inbox Triage view: ALL confirmed conflicts across ALL documents, active or deprecated."""
+    """Inbox Triage view: ALL confirmed conflicts across ALL documents."""
     try:
         conflicts = engine.fetch_all_conflicts()
         return {"status": "success", "total": len(conflicts), "conflicts": conflicts}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/triage/pairs")
+def get_triage_pairs():
+    """
+    Aggregated document-pair view for the Triage Inbox UI.
+    Returns one row per unique (source_doc, target_doc) pair with
+    conflict_count, min_drift, and latest_at so the frontend can
+    render the inbox without duplicating pairs.
+    """
+    try:
+        pairs = fetch_triage_pairs()
+        return {"status": "success", "total": len(pairs), "pairs": pairs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -170,5 +198,25 @@ def delete_document_endpoint(doc_name: str):
     try:
         engine.delete_document(doc_name)
         return {"status": "success", "message": f"Document {doc_name} destroyed."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/conflicts/{conflict_id}/dismiss")
+def dismiss_conflict_endpoint(conflict_id: int):
+    """Marks a detected conflict as a human-reviewed false positive."""
+    try:
+        dismiss_conflict(conflict_id)
+        return {"status": "success", "message": f"Conflict {conflict_id} dismissed as false positive."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/conflicts/{conflict_id}/flag")
+def flag_conflict_endpoint(conflict_id: int):
+    """Escalates a conflict to the compliance team for document revision."""
+    try:
+        flag_conflict(conflict_id)
+        return {"status": "success", "message": f"Conflict {conflict_id} flagged for revision."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

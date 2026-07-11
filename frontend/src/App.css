@@ -155,8 +155,8 @@ html, body {
   border-left: 1px solid var(--border); overflow: hidden;
   transition: width .3s cubic-bezier(.4,0,.2,1);
 }
-.drawer.open { width: 440px; }
-.drawer-inner { width: 440px; height: 100%; display: flex; flex-direction: column; }
+.drawer.open { width: 520px; }
+.drawer-inner { width: 520px; height: 100%; display: flex; flex-direction: column; }
 
 .drawer-header {
   padding: 16px 18px; border-bottom: 1px solid var(--border);
@@ -219,6 +219,13 @@ html, body {
 }
 .card-action:hover { border-color: #3a4553; color: var(--text); }
 
-::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #2a323d; border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: #1e2936; border-radius: 4px; }
+
+.custom-scrollbar::-webkit-scrollbar { width: 5px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+.custom-scrollbar::-webkit-scrollbar-thumb { background: #1c2430; border-radius: 4px; }
+
+.card-action.dismiss { color: #c6564a; border-color: rgba(198,86,74,0.25); }
+.card-action.dismiss:hover { border-color: rgba(198,86,74,0.6); background: rgba(198,86,74,0.07); }
