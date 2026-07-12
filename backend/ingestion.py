@@ -25,9 +25,13 @@ def extract_text_factory(file_path: str) -> str:
         for para in doc.paragraphs:
             if para.text.strip():
                 body_elements.append(para.text)
-            
+
             if "w:drawing" in para._p.xml:
-                body_elements.append("\n[IMAGE ALIAS: Embedde Word Diagram/Graphic Layout]\n")
+                # Always emit as a SEPARATE element so the alias always lands
+                # on its own line in the extracted text -- critical for difflib
+                # to detect image deletions as clean 'deleted' opcodes rather
+                # than absorbing them into a surrounding 'modified' hunk.
+                body_elements.append("[IMAGE ALIAS: Embedde Word Diagram/Graphic Layout]")
         return "\n".join(body_elements)
     
     # 3. PowerPoint Presentations (.pptx)

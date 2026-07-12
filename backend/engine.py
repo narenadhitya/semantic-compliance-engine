@@ -78,6 +78,125 @@ def _fetch_chunks_for_document(cur, document_name: str):
     return cur.fetchall()
 
 
+def fetch_full_text_for_document(cur, document_name: str) -> str:
+    """
+    Reconstructs the full raw text of a document by stitching chunks together
+    without the overlap duplication.  The ingestion pipeline uses chunk_overlap=60,
+    meaning the last 60 chars of chunk N are repeated at the start of chunk N+1.
+    Naive joining produces duplicated content that confuses difflib into reporting
+    massive spurious 'modified' hunks.  Instead we find the exact overlap boundary
+    and only append the non-overlapping tail of each successive chunk.
+    """
+    cur.execute(
+        f"SELECT chunk_text FROM {TABLE_NAME} WHERE document_name = %s ORDER BY id ASC;",
+        (document_name,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return ""
+
+    OVERLAP = 60  # must match RecursiveCharacterTextSplitter chunk_overlap
+
+    result = rows[0]['chunk_text']
+    for row in rows[1:]:
+        chunk = row['chunk_text']
+        # Find where this chunk overlaps with the end of the accumulated text.
+        # We search for the longest suffix of `result` that is a prefix of `chunk`,
+        # up to OVERLAP chars.  If no overlap is found we just append with a newline.
+        tail = result[-OVERLAP:] if len(result) >= OVERLAP else result
+        overlap_len = 0
+        for length in range(min(len(tail), len(chunk)), 0, -1):
+            if tail.endswith(chunk[:length]):
+                overlap_len = length
+                break
+        result += chunk[overlap_len:]
+
+    return result
+
+
+# Minimum character length for either side of a diff hunk to be considered
+# worth sending to the LLM.  Filters out trivial punctuation-only changes.
+_MIN_DIFF_CHARS = 20
+
+
+def run_structural_diff(text_a: str, text_b: str) -> list:
+    """
+    Compares two full-text strings line-by-line using difflib.SequenceMatcher
+    and returns a list of meaningful change records:
+
+        {
+          "removed": str,        # content from the OLD document (text_a)
+          "added":   str,        # content from the NEW document (text_b)  (empty for pure deletions)
+          "change_type": str     # "modified" | "deleted" | "inserted"
+        }
+
+    Hunks where BOTH removed and added are shorter than _MIN_DIFF_CHARS are
+    skipped to avoid surfacing trivial punctuation / whitespace noise.
+    IMAGE ALIAS tokens are included and will be caught as deletions when an
+    image is removed between versions.
+    """
+    lines_a = text_a.splitlines()
+    lines_b = text_b.splitlines()
+
+    matcher = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+    deltas = []
+
+    for opcode, a0, a1, b0, b1 in matcher.get_opcodes():
+        if opcode == "equal":
+            continue
+
+        removed_text = "\n".join(lines_a[a0:a1]).strip()
+        added_text   = "\n".join(lines_b[b0:b1]).strip()
+
+        # Skip hunks that are too small to be meaningful
+        if len(removed_text) < _MIN_DIFF_CHARS and len(added_text) < _MIN_DIFF_CHARS:
+            continue
+
+        if opcode == "replace":
+            change_type = "modified"
+        elif opcode == "delete":
+            change_type = "deleted"
+        elif opcode == "insert":
+            change_type = "inserted"
+        else:
+            continue  # should never happen, but be defensive
+
+        deltas.append({
+            "removed":     removed_text,
+            "added":       added_text,
+            "change_type": change_type,
+        })
+
+    # Post-processing pass: extract IMAGE ALIAS deletions that got absorbed into
+    # 'modified' hunks.  This happens when the alias token sits on the same text
+    # line as other changed content (e.g. the paragraph text was also edited).
+    # We scan every 'modified' delta and inject a dedicated 'deleted' delta for
+    # each alias that appears in the old side but not the new side.
+    image_alias_marker = "[IMAGE ALIAS"
+    extra_deltas = []
+    for delta in deltas:
+        if delta["change_type"] != "modified":
+            continue
+        aliases_removed = [
+            line.strip() for line in delta["removed"].splitlines()
+            if image_alias_marker in line
+        ]
+        aliases_added = [
+            line.strip() for line in delta["added"].splitlines()
+            if image_alias_marker in line
+        ]
+        for alias_line in aliases_removed:
+            if alias_line not in aliases_added:
+                extra_deltas.append({
+                    "removed":     alias_line,
+                    "added":       "",
+                    "change_type": "deleted",
+                })
+
+    deltas.extend(extra_deltas)
+    return deltas
+
+
 # ---------------------------------------------------------------------------
 # PHASE A: PURE VECTOR-DISTANCE DETECTION (fast, no LLM calls)
 # ---------------------------------------------------------------------------
@@ -131,7 +250,8 @@ def _insert_edge_and_conflicts(cur, source_doc, target_doc, max_sim, conflicts):
     Upserts the edge row and inserts each raw candidate conflict, storing the
     original chunk text (source_text/target_text) so the LLM judge can be run
     on it later (or re-run, since it's persisted). reasoning/summary/highlight
-    fields are left NULL until enrich_conflicts() runs.
+    fields are left NULL until enrich_conflicts() / enrich_structural_deltas() runs.
+    The detection_method column distinguishes vector-found vs structurally-found rows.
     """
     cur.execute(f"""
         INSERT INTO {EDGE_TABLE} (source_doc, target_doc, max_similarity)
@@ -144,30 +264,83 @@ def _insert_edge_and_conflicts(cur, source_doc, target_doc, max_sim, conflicts):
     edge_id = edge_row['id'] if edge_row else None
 
     for c in conflicts:
+        detection_method = c.get("detection_method", "vector")
         cur.execute(f"""
-            INSERT INTO {CONFLICT_TABLE} (edge_id, source_doc, target_doc, source_text, target_text, drift_score)
-            VALUES (%s, %s, %s, %s, %s, %s);
-        """, (edge_id, source_doc, target_doc, c['source_text'], c['target_text'], c['drift_score']))
+            INSERT INTO {CONFLICT_TABLE}
+                (edge_id, source_doc, target_doc, source_text, target_text, drift_score, detection_method)
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
+        """, (
+            edge_id,
+            source_doc,
+            target_doc,
+            c['source_text'],
+            c['target_text'],
+            c['drift_score'],
+            detection_method,
+        ))
 
     return edge_id
 
 
 def compare_versions(doc_a: str, doc_b: str):
     """
-    Phase 1: Local Delta Check (vector-only, fast). Compares the new version
-    against its predecessor and stores raw candidate conflicts. Returns the
-    edge_id so the caller (e.g. the upload endpoint) can schedule LLM
-    enrichment as a background task without blocking the HTTP response.
+    Phase 1: Local Delta Check — runs TWO complementary passes:
+
+    Pass 1 (Vector):     Fast cosine-distance scan. Catches semantic drift in
+                         chunks that are meaningfully similar but not identical.
+
+    Pass 2 (Structural): difflib line-level diff on the reconstructed full text
+                         of both documents. Catches small targeted edits (sentence
+                         rewrites, number changes) and outright deletions (including
+                         IMAGE ALIAS tokens) that fall below the vector conflict band.
+
+    Both result sets are merged and stored as raw candidate conflicts.  Structural
+    deltas are stored with drift_score=0.0 as a sentinel so enrich_structural_deltas
+    can target them separately from the vector candidates.
+
+    Returns the edge_id so the caller can schedule enrichment as background tasks.
     """
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     edge_id = None
     try:
         source_doc, target_doc = _canonical_pair(doc_a, doc_b)
-        max_sim, conflicts = _analyze_document_pair(cur, source_doc, target_doc)
 
-        if max_sim >= EDGE_THRESHOLD or len(conflicts) > 0:
-            edge_id = _insert_edge_and_conflicts(cur, source_doc, target_doc, max_sim, conflicts)
+        # --- Pass 1: Vector distance ---
+        max_sim, vector_conflicts = _analyze_document_pair(cur, source_doc, target_doc)
+
+        # --- Pass 2: Structural diff ---
+        # IMPORTANT: run diff as predecessor (doc_b) → new_upload (doc_a) so that
+        # content removed between versions shows up as "removed", not "added".
+        # _canonical_pair is only used for the vector pass and edge table key;
+        # structural diff must respect the actual upload direction.
+        text_old = fetch_full_text_for_document(cur, doc_b)  # predecessor
+        text_new = fetch_full_text_for_document(cur, doc_a)  # newly uploaded
+        structural_deltas = run_structural_diff(text_old, text_new)
+
+        print(f"[DELTA CHECK] Vector candidates: {len(vector_conflicts)} | Structural deltas: {len(structural_deltas)}")
+
+        # Convert structural deltas to the same shape as vector conflicts.
+        # drift_score=0.0 is the sentinel for "structurally detected".
+        structural_conflicts = []
+        for delta in structural_deltas:
+            structural_conflicts.append({
+                "source_text": delta["removed"] or f"[{delta['change_type'].upper()}] (no prior content)",
+                "target_text": delta["added"]   or f"[{delta['change_type'].upper()}] Content removed in new version",
+                "drift_score": 0.0,
+                "detection_method": "structural",
+                "change_type": delta["change_type"],
+            })
+
+        # Tag vector conflicts with their detection method
+        for c in vector_conflicts:
+            c["detection_method"] = "vector"
+            c.setdefault("change_type", "modified")
+
+        all_conflicts = vector_conflicts + structural_conflicts
+
+        if max_sim >= EDGE_THRESHOLD or len(all_conflicts) > 0:
+            edge_id = _insert_edge_and_conflicts(cur, source_doc, target_doc, max_sim, all_conflicts)
 
         conn.commit()
     finally:
@@ -327,6 +500,105 @@ def enrich_conflicts(edge_id: int):
         conn.close()
 
 
+def enrich_structural_deltas(edge_id: int):
+    """
+    LLM enrichment pass specifically for structurally-detected changes
+    (drift_score = 0.0, detection_method = 'structural').  Uses a
+    change-type-aware prompt so the model understands whether it is
+    reviewing a modification, a deletion, or an insertion — producing
+    compliance-focused reasoning that reflects the actual edit semantics.
+
+    Enriched rows receive the same reasoning/summary/highlight fields as
+    vector-detected conflicts so the frontend needs zero changes.
+    """
+    if not edge_id:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(f"""
+            SELECT id, source_text, target_text, detection_method
+            FROM {CONFLICT_TABLE}
+            WHERE edge_id = %s
+              AND reasoning IS NULL
+              AND detection_method = 'structural';
+        """, (edge_id,))
+        pending = cur.fetchall()
+
+        if not pending:
+            print(f"[STRUCTURAL JUDGE] No pending structural deltas for edge {edge_id}.")
+            return
+
+        print(f"[STRUCTURAL JUDGE] Enriching {len(pending)} structural delta(s) for edge {edge_id} in batches of {BATCH_SIZE}...")
+
+        for batch_start in range(0, len(pending), BATCH_SIZE):
+            batch = pending[batch_start:batch_start + BATCH_SIZE]
+
+            pairs = []
+            for row in batch:
+                # Infer change_type from the sentinel placeholders we stored
+                src = row['source_text']
+                tgt = row['target_text']
+                if "[DELETED]" in tgt or "[DELETED] Content removed" in tgt:
+                    change_type = "deleted"
+                elif "[INSERTED]" in src or "(no prior content)" in src:
+                    change_type = "inserted"
+                else:
+                    change_type = "modified"
+                pairs.append({
+                    "source_text": src,
+                    "target_text": tgt,
+                    "change_type": change_type,
+                })
+
+            result = _check_structural_changes_batch(pairs)
+
+            if result.get("judge_error", False):
+                print(f"[STRUCTURAL JUDGE] Batch failed for rows {[r['id'] for r in batch]} -- left pending for retry.")
+                time.sleep(MISTRAL_CALL_DELAY_SECONDS)
+                continue
+
+            verdict_map = {v.get("pair_index"): v for v in result.get("verdicts", [])}
+
+            for i, row in enumerate(batch):
+                verdict = verdict_map.get(i)
+                if verdict is None:
+                    print(f"[STRUCTURAL JUDGE] No verdict for row {row['id']} (pair_index {i}) -- left pending.")
+                    continue
+
+                if verdict.get("is_compliance_risk", False):
+                    cur.execute(f"""
+                        UPDATE {CONFLICT_TABLE}
+                        SET reasoning = %s,
+                            isolated_summary_a = %s,
+                            isolated_summary_b = %s,
+                            highlight_terms_a = %s,
+                            highlight_terms_b = %s
+                        WHERE id = %s;
+                    """, (
+                        verdict.get("reasoning", ""),
+                        verdict.get("isolated_summary_a", ""),
+                        verdict.get("isolated_summary_b", ""),
+                        json.dumps(verdict.get("highlight_terms_a", [])),
+                        json.dumps(verdict.get("highlight_terms_b", [])),
+                        row['id']
+                    ))
+                else:
+                    # Structural change judged as non-risky -- discard.
+                    cur.execute(f"DELETE FROM {CONFLICT_TABLE} WHERE id = %s;", (row['id'],))
+
+            conn.commit()
+            time.sleep(MISTRAL_CALL_DELAY_SECONDS)
+
+        print(f"[STRUCTURAL JUDGE] Enrichment complete for edge {edge_id}.")
+    except Exception as e:
+        print(f"[STRUCTURAL JUDGE CRITICAL ERROR] Enrichment failed for edge {edge_id}: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
 class BatchAuditItem(BaseModel):
     pair_index: int = Field(
         description="The index (starting at 0) of the segment pair this verdict corresponds to, matching the 'Pair N' label given in the prompt."
@@ -438,6 +710,134 @@ def check_logical_contradictions_batch(pairs: List[dict], max_retries: int = 3) 
                 continue
 
             print(f"[-] Batch evaluation failure: {e}")
+            return {"judge_error": True, "judge_error_message": error_str, "verdicts": []}
+
+
+# ---------------------------------------------------------------------------
+# STRUCTURAL DELTA LLM JUDGE
+# ---------------------------------------------------------------------------
+class StructuralDeltaItem(BaseModel):
+    pair_index: int = Field(
+        description="The index (starting at 0) of the change pair this verdict corresponds to."
+    )
+    is_compliance_risk: bool = Field(
+        description="True if this structural change represents a meaningful compliance risk or policy regression. False if it is benign (e.g. formatting, typo fix)."
+    )
+    reasoning: str = Field(
+        description="Detailed compliance explanation: what was changed, why it matters, and the institutional risk if the change is unreviewed."
+    )
+    highlight_terms_a: List[str] = Field(
+        description="Key phrases or values from the OLD content (Segment A) that anchor the compliance concern."
+    )
+    highlight_terms_b: List[str] = Field(
+        description="Key phrases or values from the NEW content (Segment B) that anchor the compliance concern. Empty for pure deletions."
+    )
+    isolated_summary_a: str = Field(
+        description="The 1-3 critical lines from the OLD content that best represent the compliance-relevant portion."
+    )
+    isolated_summary_b: str = Field(
+        description="The 1-3 critical lines from the NEW content showing what replaced it. Use '[Content deleted]' for pure deletions."
+    )
+
+
+class StructuralDeltaReportSchema(BaseModel):
+    verdicts: List[StructuralDeltaItem] = Field(
+        description="Exactly one verdict per input change, in any order, matched back by pair_index."
+    )
+
+
+def _check_structural_changes_batch(pairs: List[dict], max_retries: int = 3) -> dict:
+    """
+    Calls the Mistral LLM with a change-type-aware prompt to assess whether
+    each structurally-detected edit represents a compliance risk.
+    pairs: list of {"source_text": ..., "target_text": ..., "change_type": ...}
+    Returns {"judge_error": bool, "verdicts": [...]}.
+    """
+    change_blocks = []
+    for i, p in enumerate(pairs):
+        ctype = p.get("change_type", "modified").upper()
+        old_text = p["source_text"] or "(none)"
+        new_text = p["target_text"] or "(none)"
+        change_blocks.append(
+            f'--- Change {i} [{ctype}] ---\n'
+            f'OLD (predecessor): "{old_text}"\n'
+            f'NEW (updated doc): "{new_text}"'
+        )
+
+    segments_block = "\n\n".join(change_blocks)
+
+    prompt = f"""
+You are a strict corporate compliance auditor reviewing an audit trail of direct structural changes
+made between two versions of the same policy document.
+
+The changes below were detected by a line-by-line diff — they represent ACTUAL EDITS, not semantic
+similarity. Each entry is labelled with its change type:
+  [MODIFIED] — text was reworded or altered
+  [DELETED]  — content was removed entirely from the new version (including figures, images, or sections)
+  [INSERTED] — new content was added that did not exist before
+
+IMPORTANT — IMAGE ALIAS tokens:
+Tokens like [IMAGE ALIAS: Embedded PDF Visual Asset/Scan] or [IMAGE ALIAS: Embedde Word Diagram/Graphic Layout]
+represent REAL embedded visual content (charts, diagrams, figures) that existed in the document.
+If such a token appears in OLD content but NOT in NEW content, a real visual asset was DELETED.
+This is always a compliance concern: visual content may include required disclosures, process diagrams,
+certifications, or regulatory figures. ALWAYS mark image deletions as is_compliance_risk=true.
+
+{segments_block}
+
+For EACH change above (identified by its "Change N" label):
+1. Determine if this structural change introduces a compliance risk:
+   - For [MODIFIED]: did the meaning, metrics, obligations, or thresholds change?
+   - For [DELETED]: does removing this content create a gap, remove a safeguard, or drop a required disclosure?
+     If the deleted content contains [IMAGE ALIAS], it is ALWAYS a compliance risk.
+   - For [INSERTED]: does the new content conflict with existing policy or introduce an unreviewed obligation?
+2. ONLY mark is_compliance_risk=false for genuinely trivial changes: whitespace-only edits, punctuation
+   fixes, or formatting corrections where the MEANING is completely unchanged. Deletions should default
+   to is_compliance_risk=true unless you are certain the content is purely cosmetic.
+3. Extract the critical phrases that anchor the concern from each side.
+4. Write a professional compliance assessment.
+
+Respond with ONLY a single JSON object (no other text, no markdown fences) with exactly this shape:
+{{
+  "verdicts": [
+    {{
+      "pair_index": <integer matching Change N above>,
+      "is_compliance_risk": <true or false>,
+      "reasoning": "<detailed compliance assessment>",
+      "highlight_terms_a": ["<term>", "..."],
+      "highlight_terms_b": ["<term>", "..."],
+      "isolated_summary_a": "<1-3 key lines from OLD content>",
+      "isolated_summary_b": "<1-3 key lines from NEW content, or '[Content deleted]'>"
+    }}
+  ]
+}}
+Include exactly one verdict object per change given above.
+"""
+
+    for attempt in range(max_retries):
+        try:
+            response = mistral_client.chat.complete(
+                model=LLM_JUDGE_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.1
+            )
+            content = response.choices[0].message.content
+            parsed = StructuralDeltaReportSchema.model_validate_json(content)
+            return {"judge_error": False, "verdicts": [v.model_dump() for v in parsed.verdicts]}
+        except Exception as e:
+            error_str = str(e)
+            is_rate_limit = "429" in error_str or "rate" in error_str.lower()
+            if is_rate_limit and attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"[-] Structural judge rate limited (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            elif attempt < max_retries - 1:
+                print(f"[-] Structural judge response invalid (attempt {attempt + 1}/{max_retries}): {error_str}")
+                time.sleep(2)
+                continue
+            print(f"[-] Structural judge batch failure: {e}")
             return {"judge_error": True, "judge_error_message": error_str, "verdicts": []}
 
 

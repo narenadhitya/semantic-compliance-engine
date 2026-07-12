@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import engine
 from database import setup_database
 from sandbox import ingest_chunk_vectorize
-from engine import dismiss_conflict, flag_conflict, fetch_triage_pairs
+from engine import dismiss_conflict, flag_conflict, fetch_triage_pairs, enrich_structural_deltas
 
 app = FastAPI(title="Semantic Compliance Engine API")
 
@@ -14,12 +14,13 @@ app = FastAPI(title="Semantic Compliance Engine API")
 @app.on_event("startup")
 def initialize_schema():
     setup_database()
-    # Ensure the status and reviewed_at columns exist (idempotent migration)
+    # Ensure the status, reviewed_at, and detection_method columns exist (idempotent migrations)
     try:
         conn = engine.get_db_connection()
         cur = conn.cursor()
         cur.execute("ALTER TABLE detected_conflicts ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active';")
         cur.execute("ALTER TABLE detected_conflicts ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE detected_conflicts ADD COLUMN IF NOT EXISTS detection_method VARCHAR(20) DEFAULT 'vector';")
         conn.commit()
         cur.close()
         conn.close()
@@ -74,13 +75,14 @@ async def upload_document(file: UploadFile = File(...), background_tasks: Backgr
         cur.close()
         conn.close()
 
-        # 3. Compare against every predecessor (vector pass is fast)
+        # 3. Compare against every predecessor (vector pass is fast, structural diff runs here too)
         edge_ids = []
         for predecessor in predecessors:
             edge_id = engine.compare_versions(file.filename, predecessor)
             if edge_id:
                 edge_ids.append(edge_id)
                 background_tasks.add_task(engine.enrich_conflicts, edge_id)
+                background_tasks.add_task(enrich_structural_deltas, edge_id)
 
         return {
             "status": "delta_checked" if predecessors else "new_document",
