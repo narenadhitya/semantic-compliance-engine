@@ -103,7 +103,7 @@ function NeonText({ text, terms = [] }) {
 // ─────────────────────────────────────────────────────────────────
 // CONFLICT CARD
 // ─────────────────────────────────────────────────────────────────
-function ConflictCard({ conflict, idx, sourceDoc, targetDoc, onDismiss, onFlag }) {
+function ConflictCard({ conflict, idx, sourceDoc, targetDoc, onDismiss, onFlag, onResolve }) {
   const [actionState, setActionState] = useState(conflict.status || 'active');
   const [loading, setLoading] = useState(null);
 
@@ -145,8 +145,22 @@ function ConflictCard({ conflict, idx, sourceDoc, targetDoc, onDismiss, onFlag }
     }
   };
 
+  const handleResolve = async () => {
+    setLoading('resolve');
+    try {
+      await axios.patch(`${API_BASE_URL}/api/conflicts/${conflict.id}/resolve`);
+      setActionState('resolved');
+      setTimeout(() => onResolve(conflict.id), 600);
+    } catch (e) {
+      console.error('Resolve failed:', e);
+    } finally {
+      setLoading(null);
+    }
+  };
+
   const isFlagged = actionState === 'flagged';
-  const isDismissed = actionState === 'dismissed';
+  const isDismissed = actionState === 'dismissed' || actionState === 'resolved';
+  const isResolved = actionState === 'resolved';
 
   return (
     <div
@@ -273,25 +287,38 @@ function ConflictCard({ conflict, idx, sourceDoc, targetDoc, onDismiss, onFlag }
         display: 'flex', gap: '8px', padding: '12px 14px',
         borderTop: '1px solid var(--border)', background: 'rgba(0,0,0,0.2)',
       }}>
-        <button
-          id={`btn-dismiss-${conflict.id}`}
-          onClick={handleDismiss}
-          disabled={loading !== null || isDismissed || isFlagged}
-          className="btn"
-          style={{ flex: 1, justifyContent: 'center' }}
-        >
-          {loading === 'dismiss' ? '···' : isDismissed ? '✓ Dismissed' : '✗ Dismiss · False Positive'}
-        </button>
-
-        <button
-          id={`btn-flag-${conflict.id}`}
-          onClick={handleFlag}
-          disabled={loading !== null || isDismissed || isFlagged}
-          className={`btn ${isFlagged ? 'amber' : 'danger'}`}
-          style={{ flex: 1, justifyContent: 'center', fontWeight: 600 }}
-        >
-          {loading === 'flag' ? '···' : isFlagged ? '⚑ Flagged for Revision' : '⚑ Flag for Revision'}
-        </button>
+        {!isFlagged && !isResolved ? (
+          <>
+            <button
+              id={`btn-dismiss-${conflict.id}`}
+              onClick={handleDismiss}
+              disabled={loading !== null || isDismissed}
+              className="btn"
+              style={{ flex: 1, justifyContent: 'center' }}
+            >
+              {loading === 'dismiss' ? '···' : isDismissed ? '✓ Dismissed' : '✗ Dismiss · False Positive'}
+            </button>
+            <button
+              id={`btn-flag-${conflict.id}`}
+              onClick={handleFlag}
+              disabled={loading !== null || isDismissed}
+              className="btn danger"
+              style={{ flex: 1, justifyContent: 'center', fontWeight: 600 }}
+            >
+              {loading === 'flag' ? '···' : '⚑ Flag for Revision'}
+            </button>
+          </>
+        ) : (
+          <button
+            id={`btn-resolve-${conflict.id}`}
+            onClick={handleResolve}
+            disabled={loading !== null || isResolved}
+            className={`btn ${isResolved ? 'success' : 'amber'}`}
+            style={{ flex: 1, justifyContent: 'center', fontWeight: 600 }}
+          >
+            {loading === 'resolve' ? '···' : isResolved ? '✓ Review Complete' : '✓ Mark as Review Complete'}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -484,7 +511,10 @@ export default function App() {
 
   const closeDrawer = () => {
     setDrawerOpen(false);
-    setTimeout(() => setSelectedEdge(null), 300);
+    setTimeout(() => {
+      setSelectedEdge(null);
+      loadWorkspace();
+    }, 300);
   };
 
   const handleDeleteDocument = async (docName) => {
@@ -505,19 +535,20 @@ export default function App() {
   const renderNode = (node, ctx, globalScale) => {
     const label = node.id;
     const fontSize = 11.5 / globalScale;
-    const hasConflict = graphData.links.some(
+    const incidentLinks = graphData.links.filter(
       (l) =>
-        ((typeof l.source === 'object' ? l.source.id : l.source) === node.id ||
-          (typeof l.target === 'object' ? l.target.id : l.target) === node.id) &&
-        l.has_conflict
+        (typeof l.source === 'object' ? l.source.id : l.source) === node.id ||
+        (typeof l.target === 'object' ? l.target.id : l.target) === node.id
     );
+    const hasActive = incidentLinks.some(l => l.edge_status === 'active');
+    const hasFlagged = incidentLinks.some(l => l.edge_status === 'flagged');
 
     ctx.beginPath();
     ctx.arc(node.x, node.y, 6, 0, 2 * Math.PI, false);
     ctx.fillStyle = '#1c2430';
     ctx.fill();
     ctx.lineWidth = 1.5 / globalScale;
-    ctx.strokeStyle = hasConflict ? '#d1584a' : '#4c9a6d';
+    ctx.strokeStyle = hasActive ? '#d1584a' : (hasFlagged ? '#c99a4a' : '#4c9a6d');
     ctx.stroke();
     ctx.font = `${fontSize}px Inter, sans-serif`;
     ctx.textAlign = 'center';
@@ -603,7 +634,7 @@ export default function App() {
             <div className="stats-row">
               <div className="stat"><div className="stat-num">{documents.length}</div><div className="stat-label">Documents</div></div>
               <div className="stat conflict"><div className="stat-num">{triagePairs.length}</div><div className="stat-label">Conflict Pairs</div></div>
-              <div className="stat warning"><div className="stat-num">{graphData.links.filter((l) => l.has_conflict).length}</div><div className="stat-label">Graph Edges</div></div>
+              <div className="stat warning"><div className="stat-num">{graphData.links.filter((l) => l.edge_status === 'active' || l.edge_status === 'flagged').length}</div><div className="stat-label">Graph Edges</div></div>
             </div>
 
             <input ref={fileInputRef} type="file" multiple accept=".txt,.pdf,.docx" className="hidden" style={{ display: 'none' }} onChange={handleFileUpload} />
@@ -741,8 +772,8 @@ export default function App() {
                 height={dimensions.height}
                 graphData={graphData}
                 nodeRelSize={6}
-                linkColor={(link) => (link.has_conflict ? 'rgba(209, 88, 74, 0.85)' : 'rgba(76, 154, 109, 0.5)')}
-                linkWidth={(link) => (link.has_conflict ? 2.5 : 1.5)}
+                linkColor={(link) => link.edge_status === 'active' ? 'rgba(209, 88, 74, 0.85)' : link.edge_status === 'flagged' ? 'rgba(201, 154, 74, 0.85)' : 'rgba(76, 154, 109, 0.5)'}
+                linkWidth={(link) => (link.edge_status === 'active' || link.edge_status === 'flagged' ? 2.5 : 1.5)}
                 onLinkClick={handleLinkClick}
                 nodeCanvasObject={renderNode}
                 backgroundColor="transparent"
@@ -909,7 +940,7 @@ export default function App() {
                     }} title={selectedEdge.target}>{selectedEdge.target}</span>
                   </div>
                   <div className="mono" style={{ fontSize: '10px', color: 'var(--text-faint)', marginTop: '8px' }}>
-                    {conflicts.length} confirmed contradiction{conflicts.length !== 1 ? 's' : ''} detected
+                    {conflicts.filter(c => (c.status || 'active') === 'active').length} active · {conflicts.length} total
                   </div>
                 </div>
                 <button className="drawer-close" onClick={closeDrawer} style={{ flexShrink: 0, marginLeft: '8px' }}>×</button>
@@ -922,17 +953,24 @@ export default function App() {
                     Awaiting server telemetry…
                   </div>
                 ) : (
-                  conflicts.map((conflict, idx) => (
-                    <ConflictCard
-                      key={conflict.id ?? idx}
-                      conflict={conflict}
-                      idx={idx}
-                      sourceDoc={selectedEdge.source}
-                      targetDoc={selectedEdge.target}
-                      onDismiss={(id) => setConflicts((prev) => prev.filter((c) => c.id !== id))}
-                      onFlag={(id) => setConflicts((prev) => prev.map((c) => (c.id === id ? { ...c, status: 'flagged' } : c)))}
-                    />
-                  ))
+                  conflicts
+                    .slice()
+                    .sort((a, b) => {
+                      const priority = { active: 1, flagged: 2, resolved: 3, dismissed: 3 };
+                      return (priority[a.status || 'active'] || 1) - (priority[b.status || 'active'] || 1);
+                    })
+                    .map((conflict, idx) => (
+                      <ConflictCard
+                        key={conflict.id ?? idx}
+                        conflict={conflict}
+                        idx={idx}
+                        sourceDoc={selectedEdge.source}
+                        targetDoc={selectedEdge.target}
+                        onDismiss={(id) => setConflicts((prev) => prev.map((c) => (c.id === id ? { ...c, status: 'dismissed' } : c)))}
+                        onFlag={(id) => setConflicts((prev) => prev.map((c) => (c.id === id ? { ...c, status: 'flagged' } : c)))}
+                        onResolve={(id) => setConflicts((prev) => prev.map((c) => (c.id === id ? { ...c, status: 'resolved' } : c)))}
+                      />
+                    ))
                 )}
               </div>
             </div>

@@ -61,6 +61,14 @@ def setup_database():
             );
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS image_captions_cache (
+                image_hash TEXT PRIMARY KEY,
+                caption TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         cur.execute("CREATE INDEX IF NOT EXISTS corporate_policies_document_name_idx ON corporate_policies (document_name);")
         cur.execute("CREATE INDEX IF NOT EXISTS document_edges_source_target_idx ON document_edges (source_doc, target_doc);")
         cur.execute("CREATE INDEX IF NOT EXISTS detected_conflicts_source_target_idx ON detected_conflicts (source_doc, target_doc);")

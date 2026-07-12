@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import engine
 from database import setup_database
 from sandbox import ingest_chunk_vectorize
-from engine import dismiss_conflict, flag_conflict, fetch_triage_pairs, enrich_structural_deltas
+from engine import dismiss_conflict, flag_conflict, resolve_conflict, fetch_triage_pairs, enrich_structural_deltas
 
 app = FastAPI(title="Semantic Compliance Engine API")
 
@@ -220,5 +220,15 @@ def flag_conflict_endpoint(conflict_id: int):
     try:
         flag_conflict(conflict_id)
         return {"status": "success", "message": f"Conflict {conflict_id} flagged for revision."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/conflicts/{conflict_id}/resolve")
+def resolve_conflict_endpoint(conflict_id: int):
+    """Marks a flagged conflict as resolved after review."""
+    try:
+        resolve_conflict(conflict_id)
+        return {"status": "success", "message": f"Conflict {conflict_id} resolved."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -5,6 +5,9 @@ from docx import Document as DocxReader
 from pptx import Presentation as PptxReader
 from odf import text,teletype
 from odf.opendocument import load
+import re
+
+from vision import get_image_caption
 
 def extract_text_factory(file_path: str) -> str:
     if not os.path.exists(file_path):
@@ -27,11 +30,18 @@ def extract_text_factory(file_path: str) -> str:
                 body_elements.append(para.text)
 
             if "w:drawing" in para._p.xml:
-                # Always emit as a SEPARATE element so the alias always lands
-                # on its own line in the extracted text -- critical for difflib
-                # to detect image deletions as clean 'deleted' opcodes rather
-                # than absorbing them into a surrounding 'modified' hunk.
-                body_elements.append("[IMAGE ALIAS: Embedde Word Diagram/Graphic Layout]")
+                # Extract image bytes via relationship ID if possible
+                r_ids = re.findall(r'r:embed="([^"]+)"', para._p.xml)
+                if r_ids:
+                    for r_id in r_ids:
+                        try:
+                            image_part = doc.part.related_parts[r_id]
+                            caption = get_image_caption(image_part.blob)
+                            body_elements.append(caption)
+                        except Exception:
+                            body_elements.append("[IMAGE ALIAS: Embedded Word Diagram/Graphic Layout]")
+                else:
+                    body_elements.append("[IMAGE ALIAS: Embedded Word Diagram/Graphic Layout]")
         return "\n".join(body_elements)
     
     # 3. PowerPoint Presentations (.pptx)
@@ -42,9 +52,12 @@ def extract_text_factory(file_path: str) -> str:
             for shape in slide.shapes:
                 if hasattr(shape,"text") and shape.text.strip():
                     slide_text.append(shape.text.strip())
-                # 13 corresponds to the MSO_SHAPE_TYPE.PICTURE enum
                 elif shape.shape_type == 13:
-                    slide_text.append(f"\n[IMAGE ALIAS: Presentation Visual Graphic on Slide {i}]\n")
+                    try:
+                        caption = get_image_caption(shape.image.blob)
+                        slide_text.append(f"\n{caption}\n")
+                    except Exception:
+                        slide_text.append(f"\n[IMAGE ALIAS: Presentation Visual Graphic on Slide {i}]\n")
         return "\n".join(slide_text)
     
     # 4. Portable Document Format (.pdf)
@@ -57,7 +70,12 @@ def extract_text_factory(file_path: str) -> str:
                 extracted_pages.append(page_text)
             
             if page.images:
-                extracted_pages.append("\n[IMAGE ALIAS: Embedded PDF Visual Asset/Scan]\n")
+                for img in page.images:
+                    try:
+                        caption = get_image_caption(img.data)
+                        extracted_pages.append(f"\n{caption}\n")
+                    except Exception:
+                        extracted_pages.append("\n[IMAGE ALIAS: Embedded PDF Visual Asset/Scan]\n")
         return "\n".join(extracted_pages)
     
     # 5. HTML / Wiki Portals (.html, .htm)
