@@ -12,6 +12,7 @@ const STAGES = [
   { key: 'ingesting', label: 'Ingesting document…', pct: 30 },
   { key: 'comparing', label: 'Comparing against corpus…', pct: 68 },
   { key: 'analyzing', label: 'Generating analysis…', pct: 92 },
+  { key: 'deep_searching', label: 'Deep cross-document audit…', pct: 98 },
 ];
 
 // ─────────────────────────────────────────────────────────────────
@@ -505,17 +506,25 @@ export default function App() {
     }
   };
 
-  const executeDeepSearch = async () => {
+  const executeDeepSearch = async (docName) => {
     setIsDeepSearching(true);
+    // Hide popup immediately if it was triggered from there
+    if (deepSearchPrompt === docName) {
+      setDeepSearchPrompt(null);
+    }
+    
+    // Add to pending docs to show loading state in sidebar
+    setPendingDocs((prev) => [...prev, { name: docName, stage: 'deep_searching' }]);
+    
     try {
-      await axios.post(`${API_BASE_URL}/api/graph/deep-search`, { doc_id: deepSearchPrompt });
-      setTimeout(() => {
-        loadWorkspace();
-        setDeepSearchPrompt(null);
-        setIsDeepSearching(false);
-      }, 3500);
+      await axios.post(`${API_BASE_URL}/api/graph/deep-search`, { doc_id: docName });
+      await loadWorkspace();
+      pushToast(`Deep search complete for ${docName}`, 'success');
     } catch (error) {
-      console.error('Deep search failed to initiate.', error);
+      console.error('Deep search failed.', error);
+      pushToast('Deep search failed', 'error', 'Check the backend logs for details');
+    } finally {
+      setPendingDocs((prev) => prev.filter((d) => d.name !== docName));
       setIsDeepSearching(false);
     }
   };
@@ -650,7 +659,7 @@ export default function App() {
               <button onClick={() => setDeepSearchPrompt(null)} className="btn" disabled={isDeepSearching} style={{ flex: 1, justifyContent: 'center' }}>
                 Skip Full Audit
               </button>
-              <button onClick={executeDeepSearch} className="btn primary" disabled={isDeepSearching} style={{ flex: 1, justifyContent: 'center' }}>
+              <button onClick={() => executeDeepSearch(deepSearchPrompt)} className="btn primary" disabled={isDeepSearching} style={{ flex: 1, justifyContent: 'center' }}>
                 {isDeepSearching ? 'Auditing Database…' : 'Execute Deep Search'}
               </button>
             </div>
@@ -758,7 +767,7 @@ export default function App() {
                               onClick={(e) => {
                                 e.stopPropagation();
                                 setActiveMenu(null);
-                                setDeepSearchPrompt(docName);
+                                executeDeepSearch(docName);
                               }}
                               className="mono"
                               style={{
