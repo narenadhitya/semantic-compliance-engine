@@ -339,8 +339,49 @@ export default function App() {
   const [isDeepSearching, setIsDeepSearching] = useState(false);
   const [activeMenu, setActiveMenu] = useState(null);
 
+  const [sidebarWidth, setSidebarWidth] = useState(300);
+  const [drawerWidth, setDrawerWidth] = useState(460);
+
   // Default landing view is now the Triage Inbox
   const [viewMode, setViewMode] = useState('inbox');
+
+  const handleSidebarMouseDown = (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+
+    const handleMouseMove = (moveEvent) => {
+      const newWidth = Math.max(200, Math.min(600, startWidth + moveEvent.clientX - startX));
+      setSidebarWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
+
+  const handleDrawerMouseDown = (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = drawerWidth;
+
+    const handleMouseMove = (moveEvent) => {
+      const newWidth = Math.max(300, Math.min(800, startWidth - (moveEvent.clientX - startX)));
+      setDrawerWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRows, setSelectedRows] = useState(new Set());
@@ -629,8 +670,9 @@ export default function App() {
       </div>
 
       <div className="body">
-        <div className={`sidebar ${drawerOpen ? 'collapsed' : ''}`} id="sidebar">
-          <div className="sidebar-inner">
+        <div className={`sidebar ${drawerOpen ? 'collapsed' : ''}`} id="sidebar" style={{ width: sidebarWidth, position: 'relative' }}>
+          <div className="resize-handle" onMouseDown={handleSidebarMouseDown} style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '4px', cursor: 'ew-resize', zIndex: 10, background: 'transparent' }} onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'} onMouseLeave={(e) => e.target.style.background = 'transparent'}></div>
+          <div className="sidebar-inner" style={{ width: sidebarWidth }}>
             <div className="stats-row">
               <div className="stat"><div className="stat-num">{documents.length}</div><div className="stat-label">Documents</div></div>
               <div className="stat conflict"><div className="stat-num">{triagePairs.length}</div><div className="stat-label">Conflict Pairs</div></div>
@@ -905,9 +947,10 @@ export default function App() {
           )}
         </div>
 
-        <div className={`drawer ${drawerOpen ? 'open' : ''}`} id="drawer">
+        <div className={`drawer ${drawerOpen ? 'open' : ''}`} id="drawer" style={{ ...(drawerOpen ? { width: drawerWidth } : {}), position: 'relative' }}>
+          <div className="resize-handle" onMouseDown={handleDrawerMouseDown} style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '4px', cursor: 'ew-resize', zIndex: 10, background: 'transparent' }} onMouseEnter={(e) => e.target.style.background = 'rgba(255,255,255,0.1)'} onMouseLeave={(e) => e.target.style.background = 'transparent'}></div>
           {selectedEdge && (
-            <div className="drawer-inner">
+            <div className="drawer-inner" style={{ width: drawerWidth }}>
               <div style={{
                 padding: '18px 20px 14px',
                 borderBottom: '1px solid var(--border)',
