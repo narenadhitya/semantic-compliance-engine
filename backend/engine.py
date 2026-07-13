@@ -46,7 +46,7 @@ def _canonical_pair(doc_a: str, doc_b: str):
 def get_base_name(filename: str):
     """Strips extensions and versioning tags to group document histories robustly."""
     name, _ = os.path.splitext(filename)
-    base = re.sub(r'([_\-\s]*(v\d+.*|\(\d+\)|final|draft|copy|new).*)$', '', name, flags=re.IGNORECASE).strip()
+    base = re.sub(r'(?:[_\-\s]+(?:v\d+.*|\(\d+\)|final|draft|copy|new)(?:[_\-\s\.]|$)).*$', '', name, flags=re.IGNORECASE).strip()
     return base if base else name
 
 
@@ -995,8 +995,21 @@ def delete_document(document_name: str):
             WHERE document_name = %s;
         """, (document_name,))
 
+        # Remove document from cached images
+        cur.execute("""
+            UPDATE image_captions_cache
+            SET document_names = array_remove(document_names, %s)
+            WHERE %s = ANY(document_names);
+        """, (document_name, document_name))
+
+        # Delete image cache entries that no longer belong to any document
+        cur.execute("""
+            DELETE FROM image_captions_cache
+            WHERE cardinality(document_names) = 0 OR document_names IS NULL;
+        """)
+
         conn.commit()
-        print(f"[GRAPH ENGINE] Deletion complete. {document_name} eradicated.")
+        print(f"[+] Successfully purged '{document_name}' from the compliance engine.")
     finally:
         cur.close()
         conn.close()

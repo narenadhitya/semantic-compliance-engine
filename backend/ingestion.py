@@ -15,6 +15,7 @@ def extract_text_factory(file_path: str) -> str:
     
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
+    document_name = os.path.basename(file_path)
 
     # 1. Plain Text & Markdown (.txt, .md)
     if ext in ['.txt', '.md']:
@@ -36,7 +37,7 @@ def extract_text_factory(file_path: str) -> str:
                     for r_id in r_ids:
                         try:
                             image_part = doc.part.related_parts[r_id]
-                            caption = get_image_caption(image_part.blob)
+                            caption = get_image_caption(image_part.blob, document_name)
                             body_elements.append(caption)
                         except Exception:
                             body_elements.append("[IMAGE ALIAS: Embedded Word Diagram/Graphic Layout]")
@@ -54,7 +55,7 @@ def extract_text_factory(file_path: str) -> str:
                     slide_text.append(shape.text.strip())
                 elif shape.shape_type == 13:
                     try:
-                        caption = get_image_caption(shape.image.blob)
+                        caption = get_image_caption(shape.image.blob, document_name)
                         slide_text.append(f"\n{caption}\n")
                     except Exception:
                         slide_text.append(f"\n[IMAGE ALIAS: Presentation Visual Graphic on Slide {i}]\n")
@@ -72,7 +73,7 @@ def extract_text_factory(file_path: str) -> str:
             if page.images:
                 for img in page.images:
                     try:
-                        caption = get_image_caption(img.data)
+                        caption = get_image_caption(img.data, document_name)
                         extracted_pages.append(f"\n{caption}\n")
                     except Exception:
                         extracted_pages.append("\n[IMAGE ALIAS: Embedded PDF Visual Asset/Scan]\n")

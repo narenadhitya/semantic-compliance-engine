@@ -81,8 +81,6 @@ async def upload_document(file: UploadFile = File(...), background_tasks: Backgr
             edge_id = engine.compare_versions(file.filename, predecessor)
             if edge_id:
                 edge_ids.append(edge_id)
-                background_tasks.add_task(engine.enrich_conflicts, edge_id)
-                background_tasks.add_task(enrich_structural_deltas, edge_id)
 
         return {
             "status": "delta_checked" if predecessors else "new_document",
@@ -101,6 +99,26 @@ async def upload_document(file: UploadFile = File(...), background_tasks: Backgr
 
 class DeepSearchRequest(BaseModel):
     doc_id: str
+
+
+class AnalyzeRequest(BaseModel):
+    edge_ids: list[int]
+
+
+@app.post("/api/analyze")
+async def analyze_edges(request: AnalyzeRequest):
+    """
+    Synchronous LLM enrichment phase.
+    The frontend calls this after upload so it can show a real "Analyzing..." state
+    while waiting for the LLM judge to process all detected edge conflicts.
+    """
+    try:
+        for edge_id in request.edge_ids:
+            engine.enrich_conflicts(edge_id)
+            engine.enrich_structural_deltas(edge_id)
+        return {"status": "success", "message": "Analysis complete."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/graph/deep-search")
