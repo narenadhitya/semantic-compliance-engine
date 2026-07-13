@@ -474,7 +474,7 @@ export default function App() {
       for (const file of files) {
         const formData = new FormData();
         formData.append('file', file);
-        
+
         // Stage 1: Upload, Text Extraction, Vectorization, and Edge Comparison
         const res = await axios.post(`${API_BASE_URL}/api/upload`, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },

@@ -122,14 +122,18 @@ async def analyze_edges(request: AnalyzeRequest):
 
 
 @app.post("/api/graph/deep-search")
-async def trigger_deep_search(request: DeepSearchRequest, background_tasks: BackgroundTasks):
+async def trigger_deep_search(request: DeepSearchRequest):
     """
-    PHASE 2: Background Deep Search Execution.
-    engine.compute_graph_edges already handles vector detection AND the LLM
-    enrichment pass internally (both are safe to run in the background here).
+    Synchronous Deep Search Execution.
+    Runs the full cross-document comparison pipeline (vector pass + LLM judge)
+    and only returns once all conflicts are enriched. The frontend blocks on this
+    response to guarantee the workspace is fully populated when it refreshes.
     """
-    background_tasks.add_task(engine.compute_graph_edges, request.doc_id)
-    return {"status": "accepted", "message": f"Deep search initiated in the background for {request.doc_id}."}
+    try:
+        edge_ids = engine.compute_graph_edges(request.doc_id)
+        return {"status": "success", "message": f"Deep search complete for {request.doc_id}.", "edge_ids": edge_ids}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/documents")

@@ -367,8 +367,10 @@ def compute_graph_edges(new_document_name: str):
             enrich_conflicts(edge_id)
 
         print("[GRAPH ENGINE] Enrichment pass complete.")
+        return edge_ids_found
     except Exception as e:
         print(f"\n[GRAPH ENGINE CRITICAL ERROR] Deep search failed: {e}")
+        return []
 
 
 def get_pending_edge_ids():
