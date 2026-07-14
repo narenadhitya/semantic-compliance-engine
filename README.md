@@ -24,7 +24,7 @@ semantic-compliance-engine/
 │   ├── engine.py        # Graph logic, vector detection, LLM enrichment, DB queries
 │   ├── database.py      # Schema setup and connection helpers
 │   ├── ingestion.py     # Document chunking utilities
-│   ├── sandbox.py       # Ingest-chunk-vectorize pipeline entry point
+│   ├── pipeline.py      # Ingest-chunk-vectorize pipeline entry point
 │   ├── requirements.txt
 │   └── .env             # SUPABASE_URI and MISTRAL_API_KEY (not committed)
 ├── frontend/

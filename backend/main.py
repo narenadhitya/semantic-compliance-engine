@@ -5,7 +5,7 @@ import shutil
 from pydantic import BaseModel
 import engine
 from database import setup_database
-from sandbox import ingest_chunk_vectorize
+from pipeline import ingest_chunk_vectorize
 from engine import dismiss_conflict, flag_conflict, resolve_conflict, fetch_triage_pairs, enrich_structural_deltas
 
 app = FastAPI(title="Semantic Compliance Engine API")
