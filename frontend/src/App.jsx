@@ -512,10 +512,10 @@ export default function App() {
     if (deepSearchPrompt === docName) {
       setDeepSearchPrompt(null);
     }
-    
+
     // Add to pending docs to show loading state in sidebar
     setPendingDocs((prev) => [...prev, { name: docName, stage: 'deep_searching' }]);
-    
+
     try {
       await axios.post(`${API_BASE_URL}/api/graph/deep-search`, { doc_id: docName });
       await loadWorkspace();
@@ -674,8 +674,6 @@ export default function App() {
           <div className="brand-sub">Knowledge Audit</div>
         </div>
         <div className="topbar-actions">
-          <div className="status-chip"><span className="status-dot"></span> System Live</div>
-          <button className="btn">Export report</button>
           <button className="btn primary" onClick={handleRebuildGraph} disabled={uploading}>
             {uploading ? 'Processing…' : '↻ Re-index'}
           </button>
