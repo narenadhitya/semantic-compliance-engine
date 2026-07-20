@@ -701,7 +701,6 @@ export default function App() {
 
             <div className="sidebar-tabs">
               <div className="sidebar-tab active">All files</div>
-              <div className="sidebar-tab">By severity</div>
             </div>
 
             <div className="file-list">
@@ -808,10 +807,6 @@ export default function App() {
         <div className="canvas-wrap" ref={containerRef} style={{ display: 'flex', flexDirection: 'column' }}>
           <div style={{ position: 'absolute', top: '16px', left: '16px', zIndex: 10 }}>
             <ViewSwitcher viewMode={viewMode} setViewMode={setViewMode} />
-          </div>
-
-          <div className="canvas-toolbar-right">
-            <button className="btn icon">⤢</button>
           </div>
 
           {loading ? (
